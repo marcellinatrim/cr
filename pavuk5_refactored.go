@@ -4294,6 +4294,75 @@ func parseFlags() (*CLIFlags, error) {
 	return flags, nil
 }
 
+func normalizeDomainsPath(path string) string {
+	if path == "" {
+		return ""
+	}
+
+	cleaned := path
+	if runtime.GOOS == "windows" {
+		if strings.HasPrefix(path, `\\`) {
+			return filepath.Clean(path)
+		}
+		converted := filepath.FromSlash(path)
+		if strings.HasPrefix(converted, `\\`) {
+			return filepath.Clean(converted)
+		}
+		if strings.HasPrefix(converted, string(os.PathSeparator)) {
+			trimmed := strings.TrimPrefix(converted, string(os.PathSeparator))
+			if trimmed != "" {
+				converted = filepath.Join(".", trimmed)
+			}
+		}
+		cleaned = converted
+	}
+
+	return filepath.Clean(cleaned)
+}
+
+func ensureDomainsFile(path string, logger *Logger) (string, error) {
+	normalized := normalizeDomainsPath(path)
+	if normalized == "" {
+		return "", fmt.Errorf("domains file is required")
+	}
+
+	if normalized != path && logger != nil {
+		logger.Info("normalized domains file path", map[string]interface{}{"input": path, "resolved": normalized})
+	}
+
+	info, err := os.Stat(normalized)
+	if err == nil {
+		if info.IsDir() {
+			return "", fmt.Errorf("domains file path is a directory: %s", normalized)
+		}
+		return normalized, nil
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat domains file: %w", err)
+	}
+
+	dir := filepath.Dir(normalized)
+	if dir == "" {
+		dir = "."
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create domains directory: %w", err)
+	}
+
+	placeholder := []byte("# Auto-created domains list. Replace with your domains before running a full crawl.\nexample.com\n")
+	if err := os.WriteFile(normalized, placeholder, 0o644); err != nil {
+		return "", fmt.Errorf("create domains file: %w", err)
+	}
+
+	if logger != nil {
+		logger.Warn("domains file was missing; created placeholder", map[string]interface{}{"path": normalized})
+	}
+
+	return normalized, nil
+}
+
 func loadDomains(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -4324,6 +4393,14 @@ func main() {
 	}
 
 	logger := NewLogger(flags.LogLevel, flags.LogJSON)
+
+	resolvedDomainsPath, err := ensureDomainsFile(flags.DomainsFile, logger)
+	if err != nil {
+		logger.Error("failed to prepare domains file", map[string]interface{}{"error": err.Error()})
+		os.Exit(1)
+	}
+
+	flags.DomainsFile = resolvedDomainsPath
 
 	domains, err := loadDomains(flags.DomainsFile)
 	if err != nil {
