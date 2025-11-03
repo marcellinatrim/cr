@@ -3,23 +3,24 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
-	"math"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
+	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,2175 +28,2231 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
-	"golang.org/x/time/rate"
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/htmlindex"
 )
 
 // ============================================================================
-// CONFIGURATION
+// КОНФИГУРАЦИЯ
 // ============================================================================
 
 type Config struct {
-	WorkersPerDomain   int           `json:"workers_per_domain"`
-	MaxTotalWorkers    int           `json:"max_total_workers"`
-	MaxPagesPerDomain  int           `json:"max_pages_per_domain"`
-	RequestTimeout     time.Duration `json:"request_timeout"`
-	DomainTimeout      time.Duration `json:"domain_timeout"`
-	RatePerDomain      float64       `json:"rate_per_domain"`
-	OutputFile         string        `json:"output_file"`
-	CheckpointFile     string        `json:"checkpoint_file"`
-	CheckpointInterval time.Duration `json:"checkpoint_interval"`
-	RetryAttempts      int           `json:"retry_attempts"`
-	UserAgents         []string      `json:"user_agents"`
+	// Параллелизм
+	WorkersPerDomain  int
+	MaxTotalWorkers   int
+	MaxPagesPerDomain int
+	MinFindingsPerDomain int
+	
+	// Таймауты
+	HTTPTimeout         time.Duration
+	ConnectTimeout      time.Duration
+	TLSHandshakeTimeout time.Duration
+	DomainDeadline      time.Duration // 0 = без ограничения
+	
+	// HTTP
+	UserAgent      string
+	AcceptLanguage string
+	MaxRedirects   int
+	MaxBodySize    int64
+	InsecureSkipVerify bool
+	
+	// Директории
+	DiskQueueDir  string
+	CheckpointDir string
+	OutputDir     string
+	
+	// Синхронизация
+	TierSyncInterval   time.Duration
+	JSONLSyncInterval  time.Duration
+	CheckpointInterval time.Duration
+	
+	// Очереди
+	MaxRAMQueue int
+	DiskBatchSize int
+	
+	// Логирование
+	LogLevel string
+	LogJSON  bool
+	
+	// Платформа
+	WindowsMode bool
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		WorkersPerDomain:   3,
-		MaxTotalWorkers:    300,
-		MaxPagesPerDomain:  1000,
-		RequestTimeout:     90 * time.Second,
-		DomainTimeout:      30 * time.Minute,
-		RatePerDomain:      3.0,
-		OutputFile:         "comments_found.jsonl",
-		CheckpointFile:     "checkpoint.json",
-		CheckpointInterval: 60 * time.Second,
-		RetryAttempts:      3,
-		UserAgents: []string{
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-			"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-		},
+		WorkersPerDomain:     5,
+		MaxTotalWorkers:      100,
+		MaxPagesPerDomain:    5000,
+		MinFindingsPerDomain: 50,
+		
+		HTTPTimeout:         30 * time.Second,
+		ConnectTimeout:      10 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DomainDeadline:      0,
+		
+		UserAgent:      "Mozilla/5.0 (compatible; PavukBot/1.0; +http://example.com/bot)",
+		AcceptLanguage: "en-US,en;q=0.9",
+		MaxRedirects:   10,
+		MaxBodySize:    20 * 1024 * 1024, // 20 MB
+		InsecureSkipVerify: false,
+		
+		DiskQueueDir:  "./data/queue",
+		CheckpointDir: "./data/checkpoint",
+		OutputDir:     "./data/output",
+		
+		TierSyncInterval:   5 * time.Second,
+		JSONLSyncInterval:  5 * time.Second,
+		CheckpointInterval: 10 * time.Second,
+		
+		MaxRAMQueue:   512,
+		DiskBatchSize: 100,
+		
+		LogLevel: "INFO",
+		LogJSON:  false,
+		
+		WindowsMode: runtime.GOOS == "windows",
 	}
 }
 
+func (c *Config) Validate() error {
+	if c.WorkersPerDomain < 1 {
+		return fmt.Errorf("WorkersPerDomain must be >= 1, got %d", c.WorkersPerDomain)
+	}
+	if c.MaxTotalWorkers < c.WorkersPerDomain {
+		c.MaxTotalWorkers = c.WorkersPerDomain
+	}
+	if c.MaxPagesPerDomain < 50 {
+		return fmt.Errorf("MaxPagesPerDomain must be >= 50, got %d", c.MaxPagesPerDomain)
+	}
+	if c.MinFindingsPerDomain < 1 {
+		return fmt.Errorf("MinFindingsPerDomain must be >= 1, got %d", c.MinFindingsPerDomain)
+	}
+	if c.MaxRAMQueue < 10 {
+		c.MaxRAMQueue = 10
+	}
+	if c.DiskBatchSize < 1 {
+		c.DiskBatchSize = 1
+	}
+	
+	// Создание директорий
+	for _, dir := range []string{c.DiskQueueDir, c.CheckpointDir, c.OutputDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+	
+	return nil
+}
+
+func (c *Config) MaxConcurrentDomains() int {
+	max := c.MaxTotalWorkers / c.WorkersPerDomain
+	if max < 1 {
+		return 1
+	}
+	return max
+}
+
 // ============================================================================
-// CORE TYPES
+// ЛОГИРОВАНИЕ
+// ============================================================================
+
+type LogLevel int
+
+const (
+	TRACE LogLevel = iota
+	INFO
+	WARN
+	ERROR
+)
+
+func (l LogLevel) String() string {
+	switch l {
+	case TRACE:
+		return "TRACE"
+	case INFO:
+		return "INFO"
+	case WARN:
+		return "WARN"
+	case ERROR:
+		return "ERROR"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+type Logger struct {
+	level    LogLevel
+	useJSON  bool
+	mu       sync.Mutex
+}
+
+func NewLogger(levelStr string, useJSON bool) *Logger {
+	var level LogLevel
+	switch strings.ToUpper(levelStr) {
+	case "TRACE":
+		level = TRACE
+	case "INFO":
+		level = INFO
+	case "WARN":
+		level = WARN
+	case "ERROR":
+		level = ERROR
+	default:
+		level = INFO
+	}
+	return &Logger{level: level, useJSON: useJSON}
+}
+
+func (l *Logger) log(level LogLevel, msg string, fields map[string]interface{}) {
+	if level < l.level {
+		return
+	}
+	
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	
+	if l.useJSON {
+		entry := map[string]interface{}{
+			"timestamp": time.Now().Format(time.RFC3339),
+			"level":     level.String(),
+			"message":   msg,
+		}
+		for k, v := range fields {
+			entry[k] = v
+		}
+		data, _ := json.Marshal(entry)
+		fmt.Println(string(data))
+	} else {
+		var sb strings.Builder
+		sb.WriteString(time.Now().Format("2006-01-02 15:04:05"))
+		sb.WriteString(" [")
+		sb.WriteString(level.String())
+		sb.WriteString("] ")
+		sb.WriteString(msg)
+		if len(fields) > 0 {
+			sb.WriteString(" {")
+			first := true
+			for k, v := range fields {
+				if !first {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(k)
+				sb.WriteString("=")
+				sb.WriteString(fmt.Sprintf("%v", v))
+				first = false
+			}
+			sb.WriteString("}")
+		}
+		fmt.Println(sb.String())
+	}
+}
+
+func (l *Logger) Trace(msg string, fields map[string]interface{}) {
+	l.log(TRACE, msg, fields)
+}
+
+func (l *Logger) Info(msg string, fields map[string]interface{}) {
+	l.log(INFO, msg, fields)
+}
+
+func (l *Logger) Warn(msg string, fields map[string]interface{}) {
+	l.log(WARN, msg, fields)
+}
+
+func (l *Logger) Error(msg string, fields map[string]interface{}) {
+	l.log(ERROR, msg, fields)
+}
+
+// ============================================================================
+// МОДЕЛИ ДАННЫХ
 // ============================================================================
 
 type Finding struct {
-	Domain         string    `json:"domain"`
-	URL            string    `json:"url"`
-	Method         string    `json:"method"`
-	System         string    `json:"system"`
-	Confidence     float64   `json:"confidence"`
-	Tier           int       `json:"tier"`
-	HasTextarea    bool      `json:"has_textarea"`
-	TextareaCount  int       `json:"textarea_count"`
-	Signals        []string  `json:"signals"`
-	Timestamp      time.Time `json:"timestamp"`
-	PageContext    float64   `json:"page_context"`    // NEW: контекст страницы
-	URLWeight      float64   `json:"url_weight"`       // NEW: вес URL
-	FormSemantics  float64   `json:"form_semantics"`   // NEW: семантика формы
+	URL        string    `json:"url"`
+	Title      string    `json:"title"`
+	Tier       int       `json:"tier"`
+	TierLabel  string    `json:"tier_label"`
+	Confidence float64   `json:"confidence"`
+	DetectedAt time.Time `json:"detected_at"`
+	Domain     string    `json:"domain"`
+	Signals    []string  `json:"signals"`
 }
 
-type DomainCrawler struct {
-	domain      string
-	config      *Config
-	client      *http.Client
-	rateLimiter *rate.Limiter
-	visited     sync.Map
-	queue       chan string
-	results     chan *Finding
-	errors      int64
-	pages       int64
-	found       int64
-	
-	timeoutErrors   int64
-	networkErrors   int64
-	parseErrors     int64
-	notFoundErrors  int64
-	
-	// Pattern tracking для адаптивного поиска
-	successPatterns sync.Map  // URL паттерны где нашли комментарии
-	patternCounts   sync.Map  // Счетчики успешных паттернов
-	
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+type URLItem struct {
+	URL      string
+	Priority float64
+	Depth    int
 }
 
-type MainCrawler struct {
-	config         *Config
-	domains        []string
-	domainCrawlers sync.Map
-	results        chan *Finding
-	checkpoint     *Checkpoint
-	checkpointMu   sync.RWMutex
-	outputFile     *os.File
-	outputMu       sync.Mutex
-	
-	tier1File      *os.File
-	tier2File      *os.File
-	tier3File      *os.File
-	tier4File      *os.File
-	
-	tierCounts     [5]int64
-	
-	startTime      time.Time
-	domainsTotal   int64
-	domainsActive  int64
-	domainsDone    int64
-	domainsWithComments int64
-	pagesTotal     int64
-	findingsTotal  int64
-	errorsTotal    int64
-	
-	errorTypes     sync.Map
-	
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+type PageMetadata struct {
+	URL              string
+	StatusCode       int
+	ContentType      string
+	ContentLength    int64
+	LastModified     string
+	Charset          string
+	RedirectChain    []string
 }
 
-type Checkpoint struct {
-	ProcessedDomains map[string]bool   `json:"processed_domains"`
-	Statistics       map[string]int64  `json:"statistics"`
-	Timestamp        time.Time         `json:"timestamp"`
+type DomainState struct {
+	Domain       string    `json:"domain"`
+	Pages        int64     `json:"pages"`
+	Found        int64     `json:"found"`
+	Errors       int64     `json:"errors"`
+	QueueOffset  int64     `json:"queue_offset"`
+	LastActivity time.Time `json:"last_activity"`
+	Version      int       `json:"version"`
 }
 
 // ============================================================================
-// NEW: ENHANCED CONTEXT ANALYSIS
+// VISITED STORE (потокобезопасный набор посещённых URL)
 // ============================================================================
 
-// analyzeURLContext - анализирует URL для определения вероятности наличия комментариев
-func analyzeURLContext(urlStr string) (contextType string, weight float64) {
-	urlLower := strings.ToLower(urlStr)
-	
-	// Паттерны с весами
-	patterns := []struct {
-		pattern string
-		weight  float64
-		isRegex bool
-	}{
-		// Высокая вероятность комментариев
-		{"/blog/", 0.4, false},
-		{"/post/", 0.4, false},
-		{"/article/", 0.35, false},
-		{"/news/", 0.3, false},
-		{`/\d{4}/\d{2}/`, 0.35, true}, // даты в URL
-		{"/entry/", 0.3, false},
-		{"/story/", 0.3, false},
-		
-		// Средняя вероятность
-		{"/review", 0.2, false},
-		{"/product/", 0.15, false},
-		{"/topic/", 0.2, false},
-		{"/discussion/", 0.3, false},
-		
-		// Низкая вероятность (но не исключаем)
-		{"/contact", -0.3, false},
-		{"/about", -0.2, false},
-		{"/search", -0.4, false},
-		{"/category/", -0.15, false},
-		{"/tag/", -0.15, false},
-		{"/archive/", -0.1, false},
-		
-		// Системные страницы
-		{"/login", -0.5, false},
-		{"/register", -0.5, false},
-		{"/admin", -0.6, false},
-		{"/privacy", -0.4, false},
-		{"/terms", -0.4, false},
-		{"/subscribe", -0.35, false},
-		{"/unsubscribe", -0.5, false},
-		{"/checkout", -0.6, false},
-		{"/cart", -0.6, false},
-		{"/support", -0.3, false},
-		{"/help", -0.3, false},
-		{"/faq", -0.3, false},
-	}
-	
-	totalWeight := 0.0
-	matchCount := 0
-	
-	for _, p := range patterns {
-		matched := false
-		if p.isRegex {
-			if match, _ := regexp.MatchString(p.pattern, urlLower); match {
-				matched = true
-			}
-		} else {
-			if strings.Contains(urlLower, p.pattern) {
-				matched = true
-			}
-		}
-		
-		if matched {
-			totalWeight += p.weight
-			matchCount++
-		}
-	}
-	
-	// Веса накапливаются без нормализации для сохранения силы множественных сигналов
-	
-	// Определяем тип контекста
-	if totalWeight > 0.2 {
-		contextType = "content"
-	} else if totalWeight < -0.2 {
-		contextType = "system"
-	} else {
-		contextType = "neutral"
-	}
-	
-	return contextType, totalWeight
+type VisitedStore struct {
+	mu      sync.RWMutex
+	visited map[string]struct{}
 }
 
-// analyzePageStructure - анализирует структуру страницы для поиска паттернов комментариев
-func analyzePageStructure(doc *goquery.Document) float64 {
-	score := 0.0
-	
-	// Паттерн 1: Последовательность однотипных блоков (возможно комментарии)
-	repeatingBlocks := findRepeatingStructures(doc)
-	if repeatingBlocks > 5 {
-		score += 0.25
-	} else if repeatingBlocks > 3 {
-		score += 0.15
+func NewVisitedStore() *VisitedStore {
+	return &VisitedStore{
+		visited: make(map[string]struct{}),
 	}
-	
-	// Паттерн 2: Временные метки рядом с текстовыми блоками
-	timestampCount := 0
-	doc.Find("time, .date, .timestamp, [datetime], .posted, .published").Each(func(i int, s *goquery.Selection) {
-		// Проверяем наличие текстового контента рядом
-		parent := s.Parent()
-		if parent.Find("p, .text, .content, .message, .body").Length() > 0 {
-			timestampCount++
-		}
-	})
-	
-	if timestampCount > 3 {
-		score += 0.3
-	} else if timestampCount > 1 {
-		score += 0.15
-	}
-	
-	// Паттерн 3: Вложенность структур (threading)
-	nestedStructures := doc.Find(".reply, .children, .nested, .thread, .indent, [style*='margin-left'], .level-2, .depth-2")
-	if nestedStructures.Length() > 2 {
-		score += 0.35 // Сильный сигнал
-	} else if nestedStructures.Length() > 0 {
-		score += 0.2
-	}
-	
-	// Паттерн 4: Наличие аватаров/имён пользователей
-	userIndicators := doc.Find(".avatar, .user, .author, .commenter, .username, .profile-pic, img[alt*='avatar']")
-	if userIndicators.Length() > 3 {
-		score += 0.2
-	}
-	
-	// Паттерн 5: Счётчики комментариев
-	counterPatterns := []string{
-		"comments", "комментари", "отзыв", "обсужден",
-		"responses", "replies", "discussion",
-	}
-	
-	doc.Find("span, div, a").Each(func(i int, s *goquery.Selection) {
-		text := strings.ToLower(s.Text())
-		for _, pattern := range counterPatterns {
-			if strings.Contains(text, pattern) && regexp.MustCompile(`\d+`).MatchString(text) {
-				score += 0.15
-				return
-			}
-		}
-	})
-	
-	// Паттерн 6: Кнопки ответа/цитирования
-	replyButtons := doc.Find("button, a").FilterFunction(func(i int, s *goquery.Selection) bool {
-		text := strings.ToLower(s.Text())
-		return strings.Contains(text, "reply") || 
-		       strings.Contains(text, "ответить") ||
-		       strings.Contains(text, "quote") ||
-		       strings.Contains(text, "цитировать")
-	})
-	
-	if replyButtons.Length() > 2 {
-		score += 0.25
-	}
-	
-	return math.Min(score, 1.0) // Ограничиваем максимум
 }
 
-// findRepeatingStructures - находит повторяющиеся структуры на странице
-func findRepeatingStructures(doc *goquery.Document) int {
-	classCount := make(map[string]int)
+func (v *VisitedStore) LoadOrStore(url string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	
-	// Ищем div, article, section с классами
-	doc.Find("div[class], article[class], section[class], li[class]").Each(func(i int, s *goquery.Selection) {
-		class, exists := s.Attr("class")
-		if !exists || class == "" {
-			return
-		}
-		
-		// Игнорируем обёртки и контейнеры
-		classLower := strings.ToLower(class)
-		if strings.Contains(classLower, "wrapper") || 
-		   strings.Contains(classLower, "container") ||
-		   strings.Contains(classLower, "row") ||
-		   strings.Contains(classLower, "col-") {
-			return
-		}
-		
-		// Считаем только значимые классы
-		classes := strings.Fields(class)
-		for _, c := range classes {
-			if len(c) > 3 { // Игнорируем короткие классы
-				classCount[c]++
-			}
-		}
-	})
-	
-	// Находим максимальное количество повторений
-	maxRepeat := 0
-	for _, count := range classCount {
-		if count > maxRepeat {
-			maxRepeat = count
-		}
+	if _, exists := v.visited[url]; exists {
+		return true
 	}
-	
-	return maxRepeat
+	v.visited[url] = struct{}{}
+	return false
 }
 
-// analyzeFormSemantics - семантический анализ формы в контексте страницы
-func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) float64 {
-	score := 0.0
+func (v *VisitedStore) Contains(url string) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	_, exists := v.visited[url]
+	return exists
+}
+
+func (v *VisitedStore) Size() int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return len(v.visited)
+}
+
+func (v *VisitedStore) Save(path string) error {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	
-	// 1. Анализ заголовка/текста ПЕРЕД формой
-	prevAll := form.PrevAll()
-	prevText := ""
-	prevAll.Each(func(i int, s *goquery.Selection) {
-		if i < 3 { // Смотрим только 3 предыдущих элемента
-			prevText += " " + strings.ToLower(s.Text())
+	tmpPath := path + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create visited tmp file: %w", err)
+	}
+	defer f.Close()
+	
+	w := bufio.NewWriter(f)
+	for url := range v.visited {
+		if _, err := w.WriteString(url + "\n"); err != nil {
+			return fmt.Errorf("write visited url: %w", err)
 		}
-	})
-	
-	// Позитивные индикаторы для комментариев
-	commentKeywords := []string{
-		"leave a comment", "add comment", "post comment",
-		"share your thoughts", "join the discussion",
-		"what do you think", "your opinion",
-		"оставить комментарий", "добавить комментарий",
-		"ваше мнение", "поделитесь мыслями",
-		"write a review", "leave feedback",
 	}
 	
-	// Негативные индикаторы (контактные формы)
-	contactKeywords := []string{
-		"contact us", "get in touch", "reach out",
-		"send us a message", "inquiry", "support request",
-		"свяжитесь с нами", "написать нам", "обратная связь",
-		"задать вопрос", "техподдержка",
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("flush visited: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync visited: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close visited: %w", err)
 	}
 	
-	for _, kw := range commentKeywords {
-		if strings.Contains(prevText, kw) {
-			score += 0.35
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename visited: %w", err)
+	}
+	
+	return nil
+}
+
+func (v *VisitedStore) Load(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("open visited: %w", err)
+	}
+	defer f.Close()
+	
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	
+	scanner := bufio.NewScanner(f)
+	
+	// Увеличение буфера до 16 МБ для обработки длинных URL
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 16*1024*1024)
+	
+	for scanner.Scan() {
+		url := strings.TrimSpace(scanner.Text())
+		if url != "" {
+			v.visited[url] = struct{}{}
+		}
+	}
+	
+	return scanner.Err()
+}
+
+// ============================================================================
+// DISK QUEUE (журнал ссылок на диске)
+// ============================================================================
+
+type DiskQueue struct {
+	path       string
+	file       *os.File
+	mu         sync.Mutex
+	offset     int64
+	batchSize  int
+	logger     *Logger
+}
+
+func NewDiskQueue(path string, batchSize int, logger *Logger) (*DiskQueue, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, fmt.Errorf("create queue dir: %w", err)
+	}
+	
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open queue file: %w", err)
+	}
+	
+	dq := &DiskQueue{
+		path:      path,
+		file:      f,
+		batchSize: batchSize,
+		logger:    logger,
+	}
+	
+	// Загрузить offset из метафайла
+	offsetPath := path + ".offset"
+	if data, err := os.ReadFile(offsetPath); err == nil {
+		if offset, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			dq.offset = offset
+		}
+	}
+	
+	return dq, nil
+}
+
+func (dq *DiskQueue) Push(batch []URLItem) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	
+	dq.mu.Lock()
+	defer dq.mu.Unlock()
+	
+	var buf bytes.Buffer
+	for _, item := range batch {
+		data, err := json.Marshal(item)
+		if err != nil {
+			dq.logger.Warn("failed to marshal url item", map[string]interface{}{"error": err.Error()})
+			continue
+		}
+		
+		// Формат: [CRC32][LENGTH][DATA]\n
+		crc := crc32.ChecksumIEEE(data)
+		line := fmt.Sprintf("%08x%08x%s\n", crc, len(data), data)
+		buf.WriteString(line)
+	}
+	
+	if _, err := dq.file.Write(buf.Bytes()); err != nil {
+		return fmt.Errorf("write queue batch: %w", err)
+	}
+	
+	if err := dq.file.Sync(); err != nil {
+		return fmt.Errorf("sync queue: %w", err)
+	}
+	
+	return nil
+}
+
+func (dq *DiskQueue) Pop(n int) ([]URLItem, error) {
+	dq.mu.Lock()
+	defer dq.mu.Unlock()
+	
+	if _, err := dq.file.Seek(dq.offset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek queue: %w", err)
+	}
+	
+	var items []URLItem
+	scanner := bufio.NewScanner(dq.file)
+	
+	// Увеличение буфера до 16 МБ для обработки длинных строк
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 16*1024*1024)
+	
+	scanned := 0
+	
+	for scanner.Scan() && scanned < n {
+		line := scanner.Text()
+		if len(line) < 16 {
+			dq.logger.Warn("malformed queue line", map[string]interface{}{"line_len": len(line)})
+			continue
+		}
+		
+		crcHex := line[0:8]
+		lenHex := line[8:16]
+		dataStr := line[16:]
+		
+		expectedCRC, err := strconv.ParseUint(crcHex, 16, 32)
+		if err != nil {
+			dq.logger.Warn("invalid crc in queue", map[string]interface{}{"error": err.Error()})
+			continue
+		}
+		
+		dataLen, err := strconv.ParseUint(lenHex, 16, 32)
+		if err != nil {
+			dq.logger.Warn("invalid length in queue", map[string]interface{}{"error": err.Error()})
+			continue
+		}
+		
+		if len(dataStr) != int(dataLen) {
+			dq.logger.Warn("length mismatch in queue", map[string]interface{}{
+				"expected": dataLen,
+				"actual":   len(dataStr),
+			})
+			continue
+		}
+		
+		actualCRC := crc32.ChecksumIEEE([]byte(dataStr))
+		if actualCRC != uint32(expectedCRC) {
+			dq.logger.Warn("crc mismatch in queue", map[string]interface{}{
+				"expected": expectedCRC,
+				"actual":   actualCRC,
+			})
+			continue
+		}
+		
+		var item URLItem
+		if err := json.Unmarshal([]byte(dataStr), &item); err != nil {
+			dq.logger.Warn("failed to unmarshal queue item", map[string]interface{}{"error": err.Error()})
+			continue
+		}
+		
+		items = append(items, item)
+		scanned++
+		dq.offset += int64(len(line)) + 1 // +1 for \n
+	}
+	
+	if err := scanner.Err(); err != nil {
+		return items, fmt.Errorf("scan queue: %w", err)
+	}
+	
+	// Сохранить offset
+	if err := dq.saveOffset(); err != nil {
+		dq.logger.Warn("failed to save queue offset", map[string]interface{}{"error": err.Error()})
+	}
+	
+	return items, nil
+}
+
+func (dq *DiskQueue) saveOffset() error {
+	offsetPath := dq.path + ".offset"
+	tmpPath := offsetPath + ".tmp"
+	
+	if err := os.WriteFile(tmpPath, []byte(strconv.FormatInt(dq.offset, 10)), 0644); err != nil {
+		return err
+	}
+	
+	return os.Rename(tmpPath, offsetPath)
+}
+
+func (dq *DiskQueue) Close() error {
+	dq.mu.Lock()
+	defer dq.mu.Unlock()
+	
+	if err := dq.saveOffset(); err != nil {
+		dq.logger.Warn("failed to save offset on close", map[string]interface{}{"error": err.Error()})
+	}
+	
+	return dq.file.Close()
+}
+
+// ============================================================================
+// PRIORITY QUEUE (RAM-heap для топовых ссылок)
+// ============================================================================
+
+type PriorityQueue struct {
+	items []URLItem
+	mu    sync.Mutex
+}
+
+func NewPriorityQueue() *PriorityQueue {
+	return &PriorityQueue{
+		items: make([]URLItem, 0),
+	}
+}
+
+func (pq *PriorityQueue) Push(item URLItem) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	
+	pq.items = append(pq.items, item)
+	pq.heapifyUp(len(pq.items) - 1)
+}
+
+func (pq *PriorityQueue) Pop() (URLItem, bool) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	
+	if len(pq.items) == 0 {
+		return URLItem{}, false
+	}
+	
+	item := pq.items[0]
+	lastIdx := len(pq.items) - 1
+	pq.items[0] = pq.items[lastIdx]
+	pq.items = pq.items[:lastIdx]
+	
+	if len(pq.items) > 0 {
+		pq.heapifyDown(0)
+	}
+	
+	return item, true
+}
+
+func (pq *PriorityQueue) Len() int {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	return len(pq.items)
+}
+
+func (pq *PriorityQueue) heapifyUp(idx int) {
+	for idx > 0 {
+		parent := (idx - 1) / 2
+		if pq.items[idx].Priority <= pq.items[parent].Priority {
 			break
 		}
+		pq.items[idx], pq.items[parent] = pq.items[parent], pq.items[idx]
+		idx = parent
 	}
-	
-	for _, kw := range contactKeywords {
-		if strings.Contains(prevText, kw) {
-			score -= 0.4
+}
+
+func (pq *PriorityQueue) heapifyDown(idx int) {
+	n := len(pq.items)
+	for {
+		largest := idx
+		left := 2*idx + 1
+		right := 2*idx + 2
+		
+		if left < n && pq.items[left].Priority > pq.items[largest].Priority {
+			largest = left
+		}
+		if right < n && pq.items[right].Priority > pq.items[largest].Priority {
+			largest = right
+		}
+		
+		if largest == idx {
 			break
 		}
-	}
-	
-	// 2. Анализ полей формы
-	textareas := form.Find("textarea")
-	inputs := form.Find("input[type!='hidden']")
-	selects := form.Find("select")
-	
-	// Проверяем имена и placeholder у textarea
-	hasGoodTextarea := false
-	textareas.Each(func(i int, ta *goquery.Selection) {
-		name := strings.ToLower(ta.AttrOr("name", ""))
-		placeholder := strings.ToLower(ta.AttrOr("placeholder", ""))
-		id := strings.ToLower(ta.AttrOr("id", ""))
 		
-		if strings.Contains(name, "comment") || 
-		   strings.Contains(placeholder, "comment") ||
-		   strings.Contains(id, "comment") {
-			hasGoodTextarea = true
-			score += 0.3
-		} else if strings.Contains(name, "message") || 
-		          strings.Contains(name, "text") ||
-		          strings.Contains(name, "content") {
-			score += 0.15
-		} else if strings.Contains(name, "body") ||
-		          strings.Contains(name, "reply") {
-			score += 0.2
-		}
-	})
-	
-	// Используем hasGoodTextarea для дополнительной проверки
-	if hasGoodTextarea {
-		score += 0.1 // Бонус за правильное имя textarea
+		pq.items[idx], pq.items[largest] = pq.items[largest], pq.items[idx]
+		idx = largest
 	}
-	
-	// Анализ input полей
-	hasEmail := false
-	hasName := false
-	hasPhone := false
-	hasSubject := false
-	hasWebsite := false
-	hasCompany := false
-	
-	inputs.Each(func(i int, inp *goquery.Selection) {
-		inputType := strings.ToLower(inp.AttrOr("type", "text"))
-		name := strings.ToLower(inp.AttrOr("name", ""))
-		placeholder := strings.ToLower(inp.AttrOr("placeholder", ""))
-		
-		combined := name + " " + placeholder + " " + inputType
-		
-		if strings.Contains(combined, "email") || inputType == "email" {
-			hasEmail = true
-		}
-		if strings.Contains(combined, "name") && !strings.Contains(combined, "username") {
-			hasName = true
-		}
-		if strings.Contains(combined, "phone") || strings.Contains(combined, "tel") || inputType == "tel" {
-			hasPhone = true
-		}
-		if strings.Contains(combined, "subject") || strings.Contains(combined, "title") {
-			hasSubject = true
-		}
-		if strings.Contains(combined, "website") || strings.Contains(combined, "url") || inputType == "url" {
-			hasWebsite = true
-		}
-		if strings.Contains(combined, "company") || strings.Contains(combined, "organization") {
-			hasCompany = true
-		}
-	})
-	
-	// Паттерн комментарной формы: name + email + website (опционально) + textarea
-	if hasName && hasEmail && !hasPhone && !hasSubject && !hasCompany {
-		score += 0.3
-		if hasWebsite {
-			score += 0.1 // URL поле часто в комментариях
-		}
-	}
-	
-	// Паттерн контактной формы: phone или subject или company
-	if hasPhone {
-		score -= 0.4
-	}
-	if hasSubject {
-		score -= 0.3
-	}
-	if hasCompany {
-		score -= 0.3
-	}
-	
-	// Наличие селектов часто указывает на контактную форму
-	if selects.Length() > 0 {
-		score -= 0.2
-	}
-	
-	// 3. Проверка кнопки отправки
-	submitBtn := form.Find("button[type='submit'], input[type='submit'], button:not([type='button'])")
-	submitText := strings.ToLower(submitBtn.Text() + " " + submitBtn.AttrOr("value", ""))
-	
-	if strings.Contains(submitText, "post comment") ||
-	   strings.Contains(submitText, "add comment") ||
-	   strings.Contains(submitText, "submit comment") ||
-	   strings.Contains(submitText, "отправить комментарий") {
-		score += 0.25
-	} else if strings.Contains(submitText, "send") ||
-	          strings.Contains(submitText, "submit") ||
-	          strings.Contains(submitText, "отправить") {
-		// Нейтральная кнопка
-		score += 0.05
-	}
-	
-	// 4. Позиция формы на странице
-	formParent := form.Parent()
-	
-	// Проверяем, находится ли форма внутри статьи
-	if formParent.Closest("article, .article, .post, .entry, .content, main").Length() > 0 {
-		score += WEIGHT_MEDIUM
-	}
-	
-	// Проверяем наличие заголовка комментариев перед формой
-	// Ищем в пределах того же родителя
-	headings := formParent.Find("h2, h3, h4, .section-title")
-	headings.Each(func(i int, h *goquery.Selection) {
-		text := strings.ToLower(h.Text())
-		if strings.Contains(text, "comment") || 
-		   strings.Contains(text, "discussion") ||
-		   strings.Contains(text, "leave") ||
-		   strings.Contains(text, "reply") {
-			score += WEIGHT_MEDIUM
-			return // прерываем цикл
-		}
-	})
-	
-	// Проверяем есть ли комментарии рядом с формой
-	if formParent.Find(".comment, .comments-list, .discussion").Length() > 0 {
-		score += WEIGHT_STRONG
-	}
-	
-	return math.Min(math.Max(score, -1.0), 1.0) // Ограничиваем диапазон [-1, 1]
-}
-
-// categorizeSignals - категоризирует сигналы на сильные, слабые и негативные
-func categorizeSignals(signals []string) (strong, weak, negative int) {
-	for _, sig := range signals {
-		sigLower := strings.ToLower(sig)
-		
-		// Сильные позитивные сигналы
-		if strings.Contains(sigLower, "existing_comments") ||
-		   strings.Contains(sigLower, "button_post_comment") ||
-		   strings.Contains(sigLower, "textarea_comment") ||
-		   strings.Contains(sigLower, "comment_section") ||
-		   strings.Contains(sigLower, "reply_button") ||
-		   strings.Contains(sigLower, "thread_structure") ||
-		   strings.Contains(sigLower, "modern_system") ||
-		   strings.Contains(sigLower, "schema_org") ||
-		   strings.Contains(sigLower, "wordpress_comments") {
-			strong++
-		} else if strings.Contains(sigLower, "in_article") ||
-		          strings.Contains(sigLower, "simple_form") ||
-		          strings.Contains(sigLower, "has_author") ||
-		          strings.Contains(sigLower, "timestamp") ||
-		          strings.Contains(sigLower, "content_url") {
-			weak++
-		} else if strings.Contains(sigLower, "has_phone") ||
-		          strings.Contains(sigLower, "has_subject") ||
-		          strings.Contains(sigLower, "contact") ||
-		          strings.Contains(sigLower, "complex_form") ||
-		          strings.Contains(sigLower, "has_company") {
-			negative++
-		}
-	}
-	
-	return strong, weak, negative
-}
-
-// Константы для категорий весов
-const (
-	WEIGHT_STRONG = 0.3
-	WEIGHT_MEDIUM = 0.15
-	WEIGHT_WEAK   = 0.05
-	WEIGHT_NEGATIVE = -0.3
-)
-
-// ============================================================================
-// ENHANCED TIER CLASSIFICATION
-// ============================================================================
-
-func classifyFindingTierV2(finding *Finding, doc *goquery.Document) int {
-	// Анализируем URL контекст (уже должен быть заполнен)
-	urlScore := finding.URLWeight
-	
-	// Анализируем структуру страницы (уже должен быть заполнен)
-	pageScore := finding.PageContext
-	
-	// Анализируем семантику формы (уже должен быть заполнен)
-	formScore := finding.FormSemantics
-	
-	// Доверие к методу детектирования
-	methodTrust := 0.0
-	switch finding.Method {
-	case "modern_system":
-		methodTrust = 0.9
-	case "native_form":
-		methodTrust = 0.5
-	case "dynamic_system":
-		methodTrust = 0.7
-	case "placeholder":
-		methodTrust = 0.3
-	}
-	
-	// Анализ сигналов
-	strongCount, weakCount, negCount := categorizeSignals(finding.Signals)
-	signalScore := float64(strongCount)*0.4 + float64(weakCount)*0.15 - float64(negCount)*0.5
-	
-	// Взвешенная сумма факторов
-	weights := map[string]float64{
-		"url":     0.15,
-		"page":    0.25,
-		"form":    0.20,
-		"method":  0.25,
-		"signals": 0.15,
-	}
-	
-	totalScore := urlScore*weights["url"] +
-	              pageScore*weights["page"] +
-	              formScore*weights["form"] +
-	              methodTrust*weights["method"] +
-	              signalScore*weights["signals"]
-	
-	// Дополнительная проверка confidence
-	totalScore = (totalScore + finding.Confidence) / 2
-	
-	// Классификация по общему баллу
-	if totalScore >= 0.75 {
-		return 1 // Определённо комментарии
-	} else if totalScore >= 0.50 {
-		return 2 // Вероятно комментарии
-	} else if totalScore >= 0.25 {
-		return 3 // Возможно комментарии
-	}
-	
-	return 4 // Сомнительно
 }
 
 // ============================================================================
-// DOMAIN CRAWLER - Enhanced version
+// RESULT WRITER (запись результатов)
 // ============================================================================
 
-func NewDomainCrawler(domain string, config *Config, results chan *Finding) *DomainCrawler {
-	ctx, cancel := context.WithTimeout(context.Background(), config.DomainTimeout)
+type ResultWriter struct {
+	outputDir     string
+	jsonlFile     *os.File
+	tierFiles     map[int]*os.File
+	uniqueURLs    map[string]struct{}
+	mu            sync.Mutex
+	jsonlSync     time.Duration
+	tierSync      time.Duration
+	lastJSONLSync time.Time
+	lastTierSync  time.Time
+	logger        *Logger
+	reopenCount   int32
+	dedupLimit    int
+	dedupCounter  int64
+}
+
+func NewResultWriter(outputDir string, jsonlSync, tierSync time.Duration, logger *Logger) (*ResultWriter, error) {
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, fmt.Errorf("create output dir: %w", err)
+	}
 	
+	jsonlPath := filepath.Join(outputDir, "findings.jsonl")
+	jsonlFile, err := os.OpenFile(jsonlPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open jsonl file: %w", err)
+	}
+	
+	tierFiles := make(map[int]*os.File)
+	for tier := 1; tier <= 4; tier++ {
+		path := filepath.Join(outputDir, fmt.Sprintf("tier%d.txt", tier))
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			jsonlFile.Close()
+			for _, tf := range tierFiles {
+				tf.Close()
+			}
+			return nil, fmt.Errorf("open tier%d file: %w", tier, err)
+		}
+		tierFiles[tier] = f
+	}
+	
+	rw := &ResultWriter{
+		outputDir:     outputDir,
+		jsonlFile:     jsonlFile,
+		tierFiles:     tierFiles,
+		uniqueURLs:    make(map[string]struct{}),
+		jsonlSync:     jsonlSync,
+		tierSync:      tierSync,
+		lastJSONLSync: time.Now(),
+		lastTierSync:  time.Now(),
+		logger:        logger,
+		dedupLimit:    100000, // Лимит на размер dedup-карты
+	}
+	
+	return rw, nil
+}
+
+func (rw *ResultWriter) WriteFinding(f Finding) error {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	
+	// Глобальный дедуп с ротацией при переполнении
+	if _, exists := rw.uniqueURLs[f.URL]; exists {
+		return nil
+	}
+	
+	// Проверка лимита dedup-карты
+	if len(rw.uniqueURLs) >= rw.dedupLimit {
+		rw.logger.Warn("dedup map limit reached, clearing", map[string]interface{}{
+			"size":    len(rw.uniqueURLs),
+			"counter": atomic.LoadInt64(&rw.dedupCounter),
+		})
+		rw.uniqueURLs = make(map[string]struct{})
+		atomic.AddInt64(&rw.dedupCounter, 1)
+	}
+	
+	rw.uniqueURLs[f.URL] = struct{}{}
+	
+	// Запись в JSONL
+	data, err := json.Marshal(f)
+	if err != nil {
+		return fmt.Errorf("marshal finding: %w", err)
+	}
+	
+	if _, err := rw.jsonlFile.Write(append(data, '\n')); err != nil {
+		// Попытка reopen
+		if err := rw.reopenJSONL(); err != nil {
+			rw.logger.Error("failed to reopen jsonl", map[string]interface{}{"error": err.Error()})
+			return fmt.Errorf("write jsonl: %w", err)
+		}
+		if _, err := rw.jsonlFile.Write(append(data, '\n')); err != nil {
+			return fmt.Errorf("write jsonl after reopen: %w", err)
+		}
+	}
+	
+	// Запись в tier файл
+	if tierFile, ok := rw.tierFiles[f.Tier]; ok {
+		line := f.URL + "\n"
+		if _, err := tierFile.WriteString(line); err != nil {
+			// Попытка reopen
+			if err := rw.reopenTier(f.Tier); err != nil {
+				rw.logger.Error("failed to reopen tier file", map[string]interface{}{
+					"tier":  f.Tier,
+					"error": err.Error(),
+				})
+				return fmt.Errorf("write tier%d: %w", f.Tier, err)
+			}
+			if _, err := tierFile.WriteString(line); err != nil {
+				return fmt.Errorf("write tier%d after reopen: %w", f.Tier, err)
+			}
+		}
+	}
+	
+	// Периодическая синхронизация
+	now := time.Now()
+	if now.Sub(rw.lastJSONLSync) >= rw.jsonlSync {
+		if err := rw.jsonlFile.Sync(); err != nil {
+			rw.logger.Warn("failed to sync jsonl", map[string]interface{}{"error": err.Error()})
+		}
+		rw.lastJSONLSync = now
+	}
+	
+	if now.Sub(rw.lastTierSync) >= rw.tierSync {
+		for tier, f := range rw.tierFiles {
+			if err := f.Sync(); err != nil {
+				rw.logger.Warn("failed to sync tier file", map[string]interface{}{
+					"tier":  tier,
+					"error": err.Error(),
+				})
+			}
+		}
+		rw.lastTierSync = now
+	}
+	
+	return nil
+}
+
+func (rw *ResultWriter) reopenJSONL() error {
+	count := atomic.AddInt32(&rw.reopenCount, 1)
+	newPath := filepath.Join(rw.outputDir, fmt.Sprintf("findings_reopened_%d.jsonl", count))
+	
+	newFile, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	
+	oldFile := rw.jsonlFile
+	rw.jsonlFile = newFile
+	oldFile.Close()
+	
+	rw.logger.Info("reopened jsonl file", map[string]interface{}{"new_path": newPath})
+	return nil
+}
+
+func (rw *ResultWriter) reopenTier(tier int) error {
+	count := atomic.AddInt32(&rw.reopenCount, 1)
+	newPath := filepath.Join(rw.outputDir, fmt.Sprintf("tier%d_reopened_%d.txt", tier, count))
+	
+	newFile, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	
+	oldFile := rw.tierFiles[tier]
+	rw.tierFiles[tier] = newFile
+	oldFile.Close()
+	
+	rw.logger.Info("reopened tier file", map[string]interface{}{
+		"tier":     tier,
+		"new_path": newPath,
+	})
+	return nil
+}
+
+func (rw *ResultWriter) Sync() error {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	
+	if err := rw.jsonlFile.Sync(); err != nil {
+		rw.logger.Warn("failed final sync jsonl", map[string]interface{}{"error": err.Error()})
+	}
+	
+	for tier, f := range rw.tierFiles {
+		if err := f.Sync(); err != nil {
+			rw.logger.Warn("failed final sync tier", map[string]interface{}{
+				"tier":  tier,
+				"error": err.Error(),
+			})
+		}
+	}
+	
+	return nil
+}
+
+func (rw *ResultWriter) Close() error {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	
+	if err := rw.jsonlFile.Close(); err != nil {
+		rw.logger.Warn("failed to close jsonl", map[string]interface{}{"error": err.Error()})
+	}
+	
+	for tier, f := range rw.tierFiles {
+		if err := f.Close(); err != nil {
+			rw.logger.Warn("failed to close tier file", map[string]interface{}{
+				"tier":  tier,
+				"error": err.Error(),
+			})
+		}
+	}
+	
+	return nil
+}
+
+// ============================================================================
+// URL NORMALIZATION & EXTRACTION
+// ============================================================================
+
+var staticExtensions = map[string]bool{
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".svg": true,
+	".pdf": true, ".zip": true, ".rar": true, ".tar": true, ".gz": true,
+	".mp4": true, ".avi": true, ".mov": true, ".wmv": true,
+	".mp3": true, ".wav": true, ".flac": true,
+	".exe": true, ".dmg": true, ".iso": true,
+	".css": true, ".js": true, ".woff": true, ".woff2": true, ".ttf": true, ".eot": true,
+}
+
+func normalizeURL(rawURL string, baseURL *url.URL) (string, error) {
+	if rawURL == "" {
+		return "", errors.New("empty url")
+	}
+	
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse url: %w", err)
+	}
+	
+	if baseURL != nil {
+		u = baseURL.ResolveReference(u)
+	}
+	
+	// Только HTTP/HTTPS
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", errors.New("not http/https")
+	}
+	
+	// Удаление фрагмента
+	u.Fragment = ""
+	
+	// Нормализация пути
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	
+	// Сортировка query параметров (allow-list подход)
+	if u.RawQuery != "" {
+		q := u.Query()
+		allowedParams := map[string]bool{
+			"p": true, "page": true, "id": true, "post": true,
+			"article": true, "cat": true, "category": true,
+			"tag": true, "search": true, "q": true,
+		}
+		
+		newQuery := url.Values{}
+		for k, v := range q {
+			if allowedParams[k] {
+				newQuery[k] = v
+			}
+		}
+		
+		u.RawQuery = newQuery.Encode()
+	}
+	
+	// Удаление trailing slash (кроме корня)
+	if len(u.Path) > 1 && strings.HasSuffix(u.Path, "/") {
+		u.Path = strings.TrimSuffix(u.Path, "/")
+	}
+	
+	// Проверка статических файлов
+	ext := strings.ToLower(filepath.Ext(u.Path))
+	if staticExtensions[ext] {
+		return "", errors.New("static file")
+	}
+	
+	return u.String(), nil
+}
+
+func isSameDomain(urlStr string, domain string) bool {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return false
+	}
+	
+	host := strings.ToLower(u.Hostname())
+	domain = strings.ToLower(domain)
+	
+	// Точное совпадение или поддомен
+	return host == domain || strings.HasSuffix(host, "."+domain)
+}
+
+func extractLinks(htmlContent []byte, baseURL *url.URL, domain string) ([]string, error) {
+	doc, err := html.Parse(bytes.NewReader(htmlContent))
+	if err != nil {
+		return nil, fmt.Errorf("parse html: %w", err)
+	}
+	
+	seen := make(map[string]bool)
+	var links []string
+	
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, attr := range n.Attr {
+				if attr.Key == "href" {
+					normalized, err := normalizeURL(attr.Val, baseURL)
+					if err != nil {
+						continue
+					}
+					
+					if !isSameDomain(normalized, domain) {
+						continue
+					}
+					
+					if !seen[normalized] {
+						seen[normalized] = true
+						links = append(links, normalized)
+					}
+					break
+				}
+			}
+		}
+		
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	
+	walk(doc)
+	return links, nil
+}
+
+// ============================================================================
+// ENCODING DETECTION & CONVERSION
+// ============================================================================
+
+func detectCharset(contentType string, body []byte) string {
+	// Из Content-Type
+	if contentType != "" {
+		parts := strings.Split(contentType, ";")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if strings.HasPrefix(strings.ToLower(part), "charset=") {
+				charset := strings.TrimPrefix(strings.ToLower(part), "charset=")
+				charset = strings.Trim(charset, "\"'")
+				return charset
+			}
+		}
+	}
+	
+	// Из meta тегов
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err == nil {
+		var findCharset func(*html.Node) string
+		findCharset = func(n *html.Node) string {
+			if n.Type == html.ElementNode && n.Data == "meta" {
+				var httpEquiv, content, charsetAttr string
+				for _, attr := range n.Attr {
+					switch strings.ToLower(attr.Key) {
+					case "http-equiv":
+						httpEquiv = strings.ToLower(attr.Val)
+					case "content":
+						content = attr.Val
+					case "charset":
+						charsetAttr = attr.Val
+					}
+				}
+				
+				if charsetAttr != "" {
+					return charsetAttr
+				}
+				
+				if httpEquiv == "content-type" && content != "" {
+					parts := strings.Split(content, ";")
+					for _, part := range parts {
+						part = strings.TrimSpace(part)
+						if strings.HasPrefix(strings.ToLower(part), "charset=") {
+							return strings.TrimPrefix(strings.ToLower(part), "charset=")
+						}
+					}
+				}
+			}
+			
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				if cs := findCharset(c); cs != "" {
+					return cs
+				}
+			}
+			return ""
+		}
+		
+		if cs := findCharset(doc); cs != "" {
+			return cs
+		}
+	}
+	
+	return "utf-8"
+}
+
+func convertToUTF8(body []byte, charsetName string) ([]byte, error) {
+	charsetName = strings.ToLower(strings.TrimSpace(charsetName))
+	
+	if charsetName == "" || charsetName == "utf-8" || charsetName == "utf8" {
+		return body, nil
+	}
+	
+	var dec *encoding.Decoder
+	
+	enc, err := htmlindex.Get(charsetName)
+	if err != nil {
+		// Fallback: вернуть как есть
+		return body, nil
+	}
+	
+	dec = enc.NewDecoder()
+	decoded, err := dec.Bytes(body)
+	if err != nil {
+		return body, nil
+	}
+	
+	return decoded, nil
+}
+
+// ============================================================================
+// HTTP CLIENT & FETCHING
+// ============================================================================
+
+type HTTPClient struct {
+	client *http.Client
+	config *Config
+	logger *Logger
+}
+
+func NewHTTPClient(config *Config, logger *Logger) *HTTPClient {
 	transport := &http.Transport{
-		MaxIdleConns:        10,
-		MaxIdleConnsPerHost: config.WorkersPerDomain,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 60 * time.Second,
+			Timeout:   config.ConnectTimeout,
+			KeepAlive: 30 * time.Second,
 		}).DialContext,
+		TLSHandshakeTimeout:   config.TLSHandshakeTimeout,
+		ResponseHeaderTimeout: config.HTTPTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: config.InsecureSkipVerify,
+		},
 	}
 	
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   config.RequestTimeout,
+		Timeout:   config.HTTPTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
+			if len(via) >= config.MaxRedirects {
 				return fmt.Errorf("too many redirects")
 			}
 			return nil
 		},
 	}
 	
-	return &DomainCrawler{
-		domain:      domain,
-		config:      config,
-		client:      client,
-		rateLimiter: rate.NewLimiter(rate.Limit(config.RatePerDomain), int(config.RatePerDomain)),
-		queue:       make(chan string, 10000),
-		results:     results,
-		ctx:         ctx,
-		cancel:      cancel,
+	return &HTTPClient{
+		client: client,
+		config: config,
+		logger: logger,
 	}
 }
 
-func (dc *DomainCrawler) Start() {
+func (hc *HTTPClient) Fetch(ctx context.Context, urlStr string) ([]byte, *PageMetadata, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create request: %w", err)
+	}
+	
+	req.Header.Set("User-Agent", hc.config.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", hc.config.AcceptLanguage)
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	
+	resp, err := hc.client.Do(req)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return nil, nil, fmt.Errorf("timeout or canceled: %w", err)
+		}
+		return nil, nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	metadata := &PageMetadata{
+		URL:           urlStr,
+		StatusCode:    resp.StatusCode,
+		ContentType:   resp.Header.Get("Content-Type"),
+		ContentLength: resp.ContentLength,
+		LastModified:  resp.Header.Get("Last-Modified"),
+	}
+	
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return nil, metadata, fmt.Errorf("bad status code: %d", resp.StatusCode)
+	}
+	
+	// Ограничение размера
+	limitedReader := io.LimitReader(resp.Body, hc.config.MaxBodySize)
+	
+	// Декомпрессия
+	var reader io.Reader = limitedReader
+	var closer io.Closer
+	encoding := resp.Header.Get("Content-Encoding")
+	
+	switch encoding {
+	case "gzip":
+		gzr, err := gzip.NewReader(limitedReader)
+		if err != nil {
+			return nil, metadata, fmt.Errorf("create gzip reader: %w", err)
+		}
+		reader = gzr
+		closer = gzr
+	case "deflate":
+		flateReader := flate.NewReader(limitedReader)
+		reader = flateReader
+		closer = flateReader.(io.Closer)
+	}
+	
+	// Обязательное закрытие декомпрессора
+	if closer != nil {
+		defer closer.Close()
+	}
+	
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		if len(body) > 0 {
+			hc.logger.Warn("partial read", map[string]interface{}{
+				"url":   urlStr,
+				"error": err.Error(),
+				"bytes": len(body),
+			})
+		} else {
+			return nil, metadata, fmt.Errorf("read body: %w", err)
+		}
+	}
+	
+	if int64(len(body)) >= hc.config.MaxBodySize {
+		return nil, metadata, fmt.Errorf("body too large: %d bytes", len(body))
+	}
+	
+	// Определение кодировки и конвертация
+	charset := detectCharset(metadata.ContentType, body)
+	metadata.Charset = charset
+	
+	utf8Body, err := convertToUTF8(body, charset)
+	if err != nil {
+		hc.logger.Warn("encoding conversion failed", map[string]interface{}{
+			"url":     urlStr,
+			"charset": charset,
+			"error":   err.Error(),
+		})
+		utf8Body = body
+	}
+	
+	return utf8Body, metadata, nil
+}
+
+// ============================================================================
+// LINK PRIORITIZATION
+// ============================================================================
+
+type LinkPrioritizer struct {
+	mu sync.RWMutex
+	patternCounts map[string]int64
+}
+
+func NewLinkPrioritizer() *LinkPrioritizer {
+	return &LinkPrioritizer{
+		patternCounts: make(map[string]int64),
+	}
+}
+
+func (lp *LinkPrioritizer) PrioritizeLink(urlStr string, depth int) float64 {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return 0.0
+	}
+	
+	score := 0.5 // Базовый скор
+	path := strings.ToLower(u.Path)
+	
+	// Семантика пути (высокий приоритет)
+	highPriorityPatterns := []string{
+		"/blog/", "/post/", "/article/", "/news/",
+		"/discussion/", "/forum/", "/thread/", "/topic/",
+		"/comment/", "/comments/",
+	}
+	
+	for _, pattern := range highPriorityPatterns {
+		if strings.Contains(path, pattern) {
+			score += 0.3
+			break
+		}
+	}
+	
+	// Индикаторы систем комментирования
+	commentSystems := []string{
+		"disqus", "giscus", "discourse", "commento",
+		"hyvor", "cusdis", "gitalk", "gitment",
+	}
+	
+	for _, sys := range commentSystems {
+		if strings.Contains(path, sys) || strings.Contains(u.RawQuery, sys) {
+			score += 0.2
+			break
+		}
+	}
+	
+	// Свежесть (год в URL)
+	currentYear := time.Now().Year()
+	for year := currentYear; year >= currentYear-2; year-- {
+		if strings.Contains(path, fmt.Sprintf("/%d/", year)) {
+			score += 0.15
+			break
+		}
+	}
+	
+	// Наличие ID/номера (скорее всего конкретная страница)
+	if strings.Contains(path, "/id/") || 
+	   strings.Contains(u.RawQuery, "id=") || 
+	   strings.Contains(u.RawQuery, "p=") ||
+	   strings.Contains(u.RawQuery, "post=") {
+		score += 0.1
+	}
+	
+	// Низкий приоритет (архивы, индексы)
+	lowPriorityPatterns := []string{
+		"/archive/", "/category/", "/tag/", "/author/",
+		"/page/", "/index", "/sitemap",
+	}
+	
+	for _, pattern := range lowPriorityPatterns {
+		if strings.Contains(path, pattern) {
+			score -= 0.2
+			break
+		}
+	}
+	
+	// Штраф за глубину
+	if depth > 3 {
+		score -= float64(depth-3) * 0.05
+	}
+	
+	// Нормализация в [0, 1]
+	if score < 0 {
+		score = 0
+	}
+	if score > 1 {
+		score = 1
+	}
+	
+	return score
+}
+
+func (lp *LinkPrioritizer) RecordSuccess(urlStr string) {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return
+	}
+	
+	pathParts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i := 1; i <= len(pathParts) && i <= 3; i++ {
+		pattern := "/" + strings.Join(pathParts[:i], "/") + "/"
+		lp.mu.Lock()
+		lp.patternCounts[pattern]++
+		lp.mu.Unlock()
+	}
+}
+
+// ============================================================================
+// COMMENT DETECTION & CLASSIFICATION
+// ============================================================================
+
+type Signal struct {
+	Type        string
+	Description string
+	Weight      float64
+}
+
+var commentSystems = []string{
+	"disqus", "discourse", "hyvor", "cusdis", "giscus", "gitalk",
+	"gitment", "commento", "commenta", "intensedebate", "cackle",
+	"livefyre", "graphcomment", "isso", "coral", "remark42",
+	"staticman", "commentbox", "fastcomments", "replybox",
+	"wp-comments", "wordpress-comments",
+}
+
+func detectComments(htmlContent []byte, metadata *PageMetadata) (*Finding, bool) {
+	doc, err := html.Parse(bytes.NewReader(htmlContent))
+	if err != nil {
+		return nil, false
+	}
+	
+	var signals []Signal
+	confidence := 0.0
+	
+	// Проверка систем комментирования
+	htmlLower := strings.ToLower(string(htmlContent))
+	for _, sys := range commentSystems {
+		if strings.Contains(htmlLower, sys) {
+			signals = append(signals, Signal{
+				Type:        "comment_system",
+				Description: fmt.Sprintf("detected_%s", sys),
+				Weight:      0.4,
+			})
+			confidence += 0.4
+		}
+	}
+	
+	// Проверка форм комментирования
+	hasForm, formSignals := detectCommentForm(doc)
+	if hasForm {
+		signals = append(signals, formSignals...)
+		confidence += 0.3
+	}
+	
+	// Проверка DOM структур комментариев
+	hasCommentStructure, structSignals := detectCommentStructure(doc)
+	if hasCommentStructure {
+		signals = append(signals, structSignals...)
+		confidence += 0.25
+	}
+	
+	// Проверка JSON-LD / OG / микроформатов
+	hasSchema, schemaSignals := detectSchemaMarkup(doc)
+	if hasSchema {
+		signals = append(signals, schemaSignals...)
+		confidence += 0.2
+	}
+	
+	// Отрицательные паттерны
+	negativePatterns := []string{
+		"comments closed", "comments are closed", "no comments",
+		"comments disabled", "login required", "sign in to comment",
+	}
+	
+	for _, pattern := range negativePatterns {
+		if strings.Contains(htmlLower, pattern) {
+			signals = append(signals, Signal{
+				Type:        "negative",
+				Description: pattern,
+				Weight:      -0.3,
+			})
+			confidence -= 0.3
+			break
+		}
+	}
+	
+	// Нормализация confidence
+	if confidence < 0 {
+		confidence = 0
+	}
+	if confidence > 1 {
+		confidence = 1
+	}
+	
+	// Минимальный порог
+	if confidence < 0.3 {
+		return nil, false
+	}
+	
+	// Извлечение title
+	title := extractTitle(doc)
+	
+	finding := &Finding{
+		URL:        metadata.URL,
+		Title:      title,
+		Confidence: confidence,
+		DetectedAt: time.Now(),
+		Signals:    make([]string, 0, len(signals)),
+	}
+	
+	for _, sig := range signals {
+		finding.Signals = append(finding.Signals, fmt.Sprintf("%s:%s", sig.Type, sig.Description))
+	}
+	
+	return finding, true
+}
+
+func detectCommentForm(n *html.Node) (bool, []Signal) {
+	var signals []Signal
+	hasTextarea := false
+	hasCommentField := false
+	hasSubmit := false
+	
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode {
+			switch node.Data {
+			case "form":
+				// Проверка action/id формы
+				for _, attr := range node.Attr {
+					val := strings.ToLower(attr.Val)
+					if (attr.Key == "action" || attr.Key == "id") && 
+					   (strings.Contains(val, "comment") || strings.Contains(val, "reply")) {
+						signals = append(signals, Signal{
+							Type:        "form",
+							Description: "comment_form_detected",
+							Weight:      0.2,
+						})
+					}
+				}
+				
+			case "textarea":
+				hasTextarea = true
+				for _, attr := range node.Attr {
+					val := strings.ToLower(attr.Val)
+					if attr.Key == "name" || attr.Key == "id" || attr.Key == "placeholder" {
+						if strings.Contains(val, "comment") || 
+						   strings.Contains(val, "reply") ||
+						   strings.Contains(val, "message") {
+							hasCommentField = true
+						}
+					}
+				}
+				
+			case "input":
+				var inputType string
+				for _, attr := range node.Attr {
+					if attr.Key == "type" {
+						inputType = strings.ToLower(attr.Val)
+					}
+				}
+				if inputType == "submit" || inputType == "button" {
+					hasSubmit = true
+				}
+				
+			case "button":
+				hasSubmit = true
+			}
+		}
+		
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	
+	walk(n)
+	
+	if hasTextarea && hasCommentField {
+		signals = append(signals, Signal{
+			Type:        "form",
+			Description: "textarea_with_comment_field",
+			Weight:      0.25,
+		})
+	}
+	
+	if hasTextarea && hasSubmit {
+		signals = append(signals, Signal{
+			Type:        "form",
+			Description: "textarea_with_submit",
+			Weight:      0.15,
+		})
+	}
+	
+	return len(signals) > 0, signals
+}
+
+func detectCommentStructure(n *html.Node) (bool, []Signal) {
+	var signals []Signal
+	commentNodes := 0
+	authorNodes := 0
+	dateNodes := 0
+	
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode {
+			for _, attr := range node.Attr {
+				val := strings.ToLower(attr.Val)
+				
+				// class/id содержат "comment"
+				if (attr.Key == "class" || attr.Key == "id") {
+					if strings.Contains(val, "comment") && !strings.Contains(val, "no-comment") {
+						commentNodes++
+					}
+					if strings.Contains(val, "author") || strings.Contains(val, "user") {
+						authorNodes++
+					}
+					if strings.Contains(val, "date") || strings.Contains(val, "time") {
+						dateNodes++
+					}
+				}
+				
+				// itemtype для микроданных
+				if attr.Key == "itemtype" {
+					if strings.Contains(val, "comment") || strings.Contains(val, "usercomments") {
+						signals = append(signals, Signal{
+							Type:        "microdata",
+							Description: "comment_itemtype",
+							Weight:      0.2,
+						})
+					}
+				}
+			}
+		}
+		
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	
+	walk(n)
+	
+	if commentNodes >= 3 {
+		signals = append(signals, Signal{
+			Type:        "structure",
+			Description: fmt.Sprintf("multiple_comment_nodes_%d", commentNodes),
+			Weight:      0.2,
+		})
+	}
+	
+	if authorNodes >= 2 && dateNodes >= 2 {
+		signals = append(signals, Signal{
+			Type:        "structure",
+			Description: "author_date_pattern",
+			Weight:      0.15,
+		})
+	}
+	
+	return len(signals) > 0, signals
+}
+
+func detectSchemaMarkup(n *html.Node) (bool, []Signal) {
+	var signals []Signal
+	htmlStr := renderNode(n)
+	htmlLower := strings.ToLower(htmlStr)
+	
+	// JSON-LD
+	if strings.Contains(htmlLower, "application/ld+json") {
+		if strings.Contains(htmlLower, "\"@type\":\"article\"") ||
+		   strings.Contains(htmlLower, "\"@type\":\"blogposting\"") ||
+		   strings.Contains(htmlLower, "\"@type\":\"newsarticle\"") {
+			signals = append(signals, Signal{
+				Type:        "jsonld",
+				Description: "article_type",
+				Weight:      0.15,
+			})
+		}
+		
+		if strings.Contains(htmlLower, "\"@type\":\"comment\"") ||
+		   strings.Contains(htmlLower, "commentcount") {
+			signals = append(signals, Signal{
+				Type:        "jsonld",
+				Description: "comment_schema",
+				Weight:      0.25,
+			})
+		}
+	}
+	
+	// Open Graph
+	if strings.Contains(htmlLower, "og:type") {
+		if strings.Contains(htmlLower, "article") {
+			signals = append(signals, Signal{
+				Type:        "opengraph",
+				Description: "og_article",
+				Weight:      0.1,
+			})
+		}
+	}
+	
+	return len(signals) > 0, signals
+}
+
+func extractTitle(n *html.Node) string {
+	var title string
+	
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode && node.Data == "title" {
+			if node.FirstChild != nil && node.FirstChild.Type == html.TextNode {
+				title = strings.TrimSpace(node.FirstChild.Data)
+				return
+			}
+		}
+		
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+			if title != "" {
+				return
+			}
+		}
+	}
+	
+	walk(n)
+	return title
+}
+
+func renderNode(n *html.Node) string {
+	var buf bytes.Buffer
+	html.Render(&buf, n)
+	return buf.String()
+}
+
+// ============================================================================
+// TIER CLASSIFICATION
+// ============================================================================
+
+func classifyFindingTier(confidence float64, signals []string) (int, string) {
+	const (
+		tier1Threshold = 0.85
+		tier2Threshold = 0.70
+		tier3Threshold = 0.50
+		hysteresis     = 0.02
+	)
+	
+	// Проверка на явные системы комментирования
+	hasExplicitSystem := false
+	for _, sig := range signals {
+		if strings.HasPrefix(sig, "comment_system:") {
+			hasExplicitSystem = true
+			break
+		}
+	}
+	
+	if confidence >= tier1Threshold || (confidence >= tier1Threshold-hysteresis && hasExplicitSystem) {
+		return 1, "абсолютная"
+	}
+	
+	if confidence >= tier2Threshold {
+		return 2, "вроде как можно разместить"
+	}
+	
+	if confidence >= tier3Threshold {
+		return 3, "сомнительно, стоит проверить"
+	}
+	
+	return 4, "нетипичный формат, может подойти"
+}
+
+// ============================================================================
+// CHECKPOINT MANAGEMENT
+// ============================================================================
+
+type CheckpointManager struct {
+	checkpointDir string
+	mu            sync.Mutex
+	logger        *Logger
+}
+
+func NewCheckpointManager(dir string, logger *Logger) (*CheckpointManager, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("create checkpoint dir: %w", err)
+	}
+	
+	return &CheckpointManager{
+		checkpointDir: dir,
+		logger:        logger,
+	}, nil
+}
+
+func (cm *CheckpointManager) SaveDomainState(domain string, state *DomainState) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	
+	state.Version = 1
+	
+	filename := fmt.Sprintf("%s.json", sanitizeDomainName(domain))
+	path := filepath.Join(cm.checkpointDir, filename)
+	tmpPath := path + ".tmp"
+	
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal state: %w", err)
+	}
+	
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("write tmp checkpoint: %w", err)
+	}
+	
+	// fsync
+	f, err := os.OpenFile(tmpPath, os.O_RDWR, 0644)
+	if err == nil {
+		f.Sync()
+		f.Close()
+	}
+	
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename checkpoint: %w", err)
+	}
+	
+	return nil
+}
+
+func (cm *CheckpointManager) LoadDomainState(domain string) (*DomainState, error) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	
+	filename := fmt.Sprintf("%s.json", sanitizeDomainName(domain))
+	path := filepath.Join(cm.checkpointDir, filename)
+	
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &DomainState{
+				Domain:       domain,
+				LastActivity: time.Now(),
+			}, nil
+		}
+		return nil, fmt.Errorf("read checkpoint: %w", err)
+	}
+	
+	var state DomainState
+	if err := json.Unmarshal(data, &state); err != nil {
+		cm.logger.Warn("corrupted checkpoint, starting fresh", map[string]interface{}{
+			"domain": domain,
+			"error":  err.Error(),
+		})
+		return &DomainState{
+			Domain:       domain,
+			LastActivity: time.Now(),
+		}, nil
+	}
+	
+	// Миграция версий (если нужно в будущем)
+	if state.Version == 0 {
+		state.Version = 1
+	}
+	
+	return &state, nil
+}
+
+func sanitizeDomainName(domain string) string {
+	domain = strings.ReplaceAll(domain, ":", "_")
+	domain = strings.ReplaceAll(domain, "/", "_")
+	domain = strings.ReplaceAll(domain, "\\", "_")
+	return domain
+}
+
+// ============================================================================
+// DOMAIN CRAWLER (обход одного домена)
+// ============================================================================
+
+type DomainCrawler struct {
+	domain        string
+	config        *Config
+	httpClient    *HTTPClient
+	resultWriter  *ResultWriter
+	visited       *VisitedStore
+	ramQueue      *PriorityQueue
+	diskQueue     *DiskQueue
+	prioritizer   *LinkPrioritizer
+	checkpoint    *CheckpointManager
+	logger        *Logger
+	
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	
+	pages         int64
+	found         int64
+	errors        int64
+	lastActivity  time.Time
+	activityMu    sync.Mutex
+	
+	stopping      int32
+}
+
+func NewDomainCrawler(
+	domain string,
+	config *Config,
+	httpClient *HTTPClient,
+	resultWriter *ResultWriter,
+	checkpoint *CheckpointManager,
+	logger *Logger,
+) (*DomainCrawler, error) {
+	
+	ctx, cancel := context.WithCancel(context.Background())
+	if config.DomainDeadline > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), config.DomainDeadline)
+	}
+	
+	queuePath := filepath.Join(config.DiskQueueDir, sanitizeDomainName(domain)+".queue")
+	diskQueue, err := NewDiskQueue(queuePath, config.DiskBatchSize, logger)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("create disk queue: %w", err)
+	}
+	
+	dc := &DomainCrawler{
+		domain:       domain,
+		config:       config,
+		httpClient:   httpClient,
+		resultWriter: resultWriter,
+		visited:      NewVisitedStore(),
+		ramQueue:     NewPriorityQueue(),
+		diskQueue:    diskQueue,
+		prioritizer:  NewLinkPrioritizer(),
+		checkpoint:   checkpoint,
+		logger:       logger,
+		ctx:          ctx,
+		cancel:       cancel,
+		lastActivity: time.Now(),
+	}
+	
+	// Загрузка состояния
+	if err := dc.loadState(); err != nil {
+		dc.logger.Warn("failed to load domain state", map[string]interface{}{
+			"domain": domain,
+			"error":  err.Error(),
+		})
+	}
+	
+	return dc, nil
+}
+
+func (dc *DomainCrawler) loadState() error {
+	state, err := dc.checkpoint.LoadDomainState(dc.domain)
+	if err != nil {
+		return err
+	}
+	
+	atomic.StoreInt64(&dc.pages, state.Pages)
+	atomic.StoreInt64(&dc.found, state.Found)
+	atomic.StoreInt64(&dc.errors, state.Errors)
+	dc.lastActivity = state.LastActivity
+	
+	// Загрузка visited
+	visitedPath := filepath.Join(dc.config.CheckpointDir, sanitizeDomainName(dc.domain)+"_visited.jsonl")
+	if err := dc.visited.Load(visitedPath); err != nil {
+		dc.logger.Warn("failed to load visited", map[string]interface{}{
+			"domain": dc.domain,
+			"error":  err.Error(),
+		})
+	}
+	
+	dc.logger.Info("loaded domain state", map[string]interface{}{
+		"domain":  dc.domain,
+		"pages":   state.Pages,
+		"found":   state.Found,
+		"visited": dc.visited.Size(),
+	})
+	
+	return nil
+}
+
+func (dc *DomainCrawler) saveState() error {
+	state := &DomainState{
+		Domain:       dc.domain,
+		Pages:        atomic.LoadInt64(&dc.pages),
+		Found:        atomic.LoadInt64(&dc.found),
+		Errors:       atomic.LoadInt64(&dc.errors),
+		QueueOffset:  0,
+		LastActivity: dc.getLastActivity(),
+	}
+	
+	if err := dc.checkpoint.SaveDomainState(dc.domain, state); err != nil {
+		return err
+	}
+	
+	// Сохранение visited
+	visitedPath := filepath.Join(dc.config.CheckpointDir, sanitizeDomainName(dc.domain)+"_visited.jsonl")
+	if err := dc.visited.Save(visitedPath); err != nil {
+		return err
+	}
+	
+	return nil
+}
+
+func (dc *DomainCrawler) Start(ctx context.Context) error {
+	dc.logger.Info("starting domain crawler", map[string]interface{}{"domain": dc.domain})
+	
+	// Посев начальных URL
+	if err := dc.seedInitialURLs(); err != nil {
+		dc.logger.Error("failed to seed urls", map[string]interface{}{
+			"domain": dc.domain,
+			"error":  err.Error(),
+		})
+		return err
+	}
+	
+	// Запуск воркеров
 	for i := 0; i < dc.config.WorkersPerDomain; i++ {
 		dc.wg.Add(1)
 		go dc.worker(i)
 	}
 	
-	dc.seedInitialURLs()
-	
+	// Запуск монитора
 	dc.wg.Add(1)
 	go dc.monitor()
+	
+	// Запуск периодического чекпоинта
+	dc.wg.Add(1)
+	go dc.checkpointLoop()
+	
+	// Ожидание завершения
+	dc.wg.Wait()
+	
+	// Финальное сохранение
+	if err := dc.saveState(); err != nil {
+		dc.logger.Warn("failed to save final state", map[string]interface{}{
+			"domain": dc.domain,
+			"error":  err.Error(),
+		})
+	}
+	
+	dc.logger.Info("domain crawler finished", map[string]interface{}{
+		"domain": dc.domain,
+		"pages":  atomic.LoadInt64(&dc.pages),
+		"found":  atomic.LoadInt64(&dc.found),
+		"errors": atomic.LoadInt64(&dc.errors),
+	})
+	
+	return nil
 }
 
-func (dc *DomainCrawler) seedInitialURLs() {
-	mainURL := "https://" + dc.domain
+func (dc *DomainCrawler) seedInitialURLs() error {
+	baseURL := fmt.Sprintf("https://%s/", dc.domain)
 	
-	doc, finalURL, err := dc.fetchAndParse(mainURL)
-	if err != nil {
-		mainURL = "http://" + dc.domain
-		doc, finalURL, err = dc.fetchAndParse(mainURL)
-		if err != nil {
-			log.Printf("[%s] Main page failed, trying sitemap", dc.domain)
-			dc.processSitemap()
-			
-			if len(dc.queue) == 0 {
-				log.Printf("[%s] No accessible pages found", dc.domain)
-				dc.cancel()
-				return
-			}
-			return
+	// Домашняя страница
+	if !dc.visited.Contains(baseURL) {
+		dc.enqueueURL(baseURL, 0.8, 0)
+	}
+	
+	// Попытка загрузить sitemap
+	sitemapURL := fmt.Sprintf("https://%s/sitemap.xml", dc.domain)
+	dc.enqueueURL(sitemapURL, 0.5, 0)
+	
+	// Типичные страницы
+	commonPaths := []string{
+		"/blog/", "/posts/", "/articles/", "/news/",
+		"/forum/", "/community/", "/discussion/",
+	}
+	
+	for _, path := range commonPaths {
+		url := fmt.Sprintf("https://%s%s", dc.domain, path)
+		if !dc.visited.Contains(url) {
+			dc.enqueueURL(url, 0.6, 0)
 		}
 	}
 	
-	dc.visited.Store(finalURL, true)
-	atomic.AddInt64(&dc.pages, 1)
+	return nil
+}
+
+func (dc *DomainCrawler) enqueueURL(urlStr string, priority float64, depth int) {
+	item := URLItem{
+		URL:      urlStr,
+		Priority: priority,
+		Depth:    depth,
+	}
 	
-	dc.detectComments(doc, finalURL)
-	
-	links := dc.extractLinks(doc, finalURL)
-	prioritized := dc.prioritizeLinks(links)
-	for _, link := range prioritized {
-		select {
-		case dc.queue <- link:
-		default:
+	// Сначала в RAM очередь
+	if dc.ramQueue.Len() < dc.config.MaxRAMQueue {
+		dc.ramQueue.Push(item)
+	} else {
+		// Пролив в disk очередь
+		if err := dc.diskQueue.Push([]URLItem{item}); err != nil {
+			dc.logger.Warn("failed to push to disk queue", map[string]interface{}{
+				"url":   urlStr,
+				"error": err.Error(),
+			})
 		}
 	}
 	
-	dc.processSitemap()
+	dc.updateActivity()
 }
 
 func (dc *DomainCrawler) worker(id int) {
 	defer dc.wg.Done()
-	
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[%s] Worker %d recovered from panic: %v", dc.domain, id, r)
-			dc.wg.Add(1)
-			go dc.worker(id)
+			dc.logger.Error("worker panic recovered", map[string]interface{}{
+				"worker_id": id,
+				"domain":    dc.domain,
+				"panic":     r,
+			})
 		}
 	}()
+	
+	dc.logger.Trace("worker started", map[string]interface{}{
+		"worker_id": id,
+		"domain":    dc.domain,
+	})
 	
 	for {
 		select {
 		case <-dc.ctx.Done():
+			dc.logger.Trace("worker stopping", map[string]interface{}{
+				"worker_id": id,
+				"domain":    dc.domain,
+			})
 			return
-			
-		case url := <-dc.queue:
-			if url == "" {
-				continue
-			}
-			
-			if _, visited := dc.visited.LoadOrStore(url, true); visited {
-				continue
-			}
-			
-			if atomic.LoadInt64(&dc.pages) >= int64(dc.config.MaxPagesPerDomain) {
-				continue
-			}
-			
-			dc.rateLimiter.Wait(dc.ctx)
-			dc.processURL(url)
-			
-			pages := atomic.LoadInt64(&dc.pages)
-			found := atomic.LoadInt64(&dc.found)
-			
-			if found >= 50 {
-				log.Printf("[%s] Found enough comments (%d pages), stopping", dc.domain, found)
-				dc.cancel()
-				return
-			}
-			
-			if pages >= int64(dc.config.MaxPagesPerDomain) {
-				log.Printf("[%s] Reached page limit (%d), found %d comments", dc.domain, pages, found)
-				dc.cancel()
-				return
-			}
+		default:
 		}
+		
+		// Проверка стоп-условий
+		if dc.shouldStop() {
+			dc.logger.Trace("worker detected stop condition", map[string]interface{}{
+				"worker_id": id,
+				"domain":    dc.domain,
+			})
+			dc.cancel()
+			return
+		}
+		
+		// Получение URL из очереди
+		item, ok := dc.dequeueURL()
+		if !ok {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		
+		dc.processURL(item)
 	}
 }
 
-func (dc *DomainCrawler) processURL(url string) {
-	atomic.AddInt64(&dc.pages, 1)
+func (dc *DomainCrawler) dequeueURL() (URLItem, bool) {
+	// Сначала из RAM
+	if item, ok := dc.ramQueue.Pop(); ok {
+		return item, true
+	}
 	
-	doc, finalURL, err := dc.fetchAndParse(url)
+	// Затем из disk
+	items, err := dc.diskQueue.Pop(10)
+	if err != nil {
+		dc.logger.Warn("failed to pop from disk queue", map[string]interface{}{
+			"domain": dc.domain,
+			"error":  err.Error(),
+		})
+		return URLItem{}, false
+	}
+	
+	if len(items) == 0 {
+		return URLItem{}, false
+	}
+	
+	// Первый элемент возвращаем, остальные в RAM
+	for i := 1; i < len(items); i++ {
+		if dc.ramQueue.Len() < dc.config.MaxRAMQueue {
+			dc.ramQueue.Push(items[i])
+		} else {
+			break
+		}
+	}
+	
+	return items[0], true
+}
+
+func (dc *DomainCrawler) processURL(item URLItem) {
+	// Дедуп через visited
+	if dc.visited.LoadOrStore(item.URL) {
+		return
+	}
+	
+	dc.logger.Trace("processing url", map[string]interface{}{
+		"domain":   dc.domain,
+		"url":      item.URL,
+		"priority": item.Priority,
+		"depth":    item.Depth,
+	})
+	
+	// Контекст с таймаутом для запроса
+	ctx, cancel := context.WithTimeout(dc.ctx, dc.config.HTTPTimeout)
+	defer cancel()
+	
+	// Загрузка страницы
+	body, metadata, err := dc.httpClient.Fetch(ctx, item.URL)
 	if err != nil {
 		atomic.AddInt64(&dc.errors, 1)
-		errStr := err.Error()
-		
-		// Детальное логирование ошибок
-		if strings.Contains(errStr, "timeout") {
-			atomic.AddInt64(&dc.timeoutErrors, 1)
-			log.Printf("[%s] Timeout error on %s: %v", dc.domain, url, err)
-		} else if strings.Contains(errStr, "status 404") {
-			atomic.AddInt64(&dc.notFoundErrors, 1)
-			// 404 не логируем, это нормально
-		} else if strings.Contains(errStr, "connection refused") {
-			atomic.AddInt64(&dc.networkErrors, 1)
-			log.Printf("[%s] Network error: %v", dc.domain, err)
-		} else if strings.Contains(errStr, "status 403") || strings.Contains(errStr, "status 401") {
-			log.Printf("[%s] Access denied on %s: %v", dc.domain, url, err)
-		} else {
-			atomic.AddInt64(&dc.parseErrors, 1)
-			log.Printf("[%s] Parse error on %s: %v", dc.domain, url, err)
-		}
+		dc.logger.Trace("fetch failed", map[string]interface{}{
+			"domain": dc.domain,
+			"url":    item.URL,
+			"error":  err.Error(),
+		})
 		return
 	}
 	
-	// Получаем лучшую находку
-	finding := dc.detectComments(doc, finalURL)
+	atomic.AddInt64(&dc.pages, 1)
+	dc.updateActivity()
 	
-	if finding != nil {
-		// Классифицируем с новой системой
-		tier := classifyFindingTierV2(finding, doc)
-		finding.Tier = tier
-		
-		// Фильтруем только совсем мусорные
-		if finding.Confidence < 0.1 {
-			log.Printf("[%s] Skipping very low confidence (%.2f) on %s", dc.domain, finding.Confidence, url)
-			return
-		}
-		
-		// Для tier 4 с очень низкой confidence - логируем и пропускаем
-		if tier == 4 && finding.Confidence < 0.3 {
-			log.Printf("[%s] Skipping tier 4 with low confidence (%.2f) on %s", dc.domain, finding.Confidence, url)
-			return
-		}
-		
-		dc.results <- finding
-		atomic.AddInt64(&dc.found, 1)
-		
-		// НОВОЕ: Обучаемся на успешной находке
-		if tier <= 2 && finding.Confidence >= 0.7 {
-			dc.learnFromSuccess(finalURL)
-		}
-		
-		// Логируем находки по уровням
-		switch tier {
-		case 1:
-			log.Printf("[%s] TIER 1 found: %s (system: %s, confidence: %.2f)", 
-				dc.domain, finalURL, finding.System, finding.Confidence)
-		case 2:
-			log.Printf("[%s] Tier 2 found: %s (confidence: %.2f)", 
-				dc.domain, finalURL, finding.Confidence)
-		}
-	}
-	
-	// Продолжаем обход для стратегии "умри, но найди"
-	if atomic.LoadInt64(&dc.pages) < int64(dc.config.MaxPagesPerDomain) {
-		links := dc.extractLinks(doc, finalURL)
-		
-		// Используем улучшенную приоритизацию с извлечением дат из HTML
-		prioritized := dc.prioritizeLinksByFreshnessEnhanced(links, doc)
-		
-		for _, link := range prioritized {
-			if _, visited := dc.visited.Load(link); !visited {
-				select {
-				case dc.queue <- link:
-				default:
-				}
-			}
-		}
-	}
-}
-
-func (dc *DomainCrawler) fetchAndParse(url string) (*goquery.Document, string, error) {
-	var lastErr error
-	
-	for attempt := 1; attempt <= dc.config.RetryAttempts; attempt++ {
-		req, err := http.NewRequestWithContext(dc.ctx, "GET", url, nil)
-		if err != nil {
-			return nil, "", err
-		}
-		
-		ua := dc.config.UserAgents[rand.Intn(len(dc.config.UserAgents))]
-		req.Header.Set("User-Agent", ua)
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
-		
-		resp, err := dc.client.Do(req)
-		if err != nil {
-			lastErr = err
-			if strings.Contains(err.Error(), "timeout") && attempt < dc.config.RetryAttempts {
-				time.Sleep(time.Second * time.Duration(attempt*2))
-				continue
-			}
-			return nil, "", err
-		}
-		defer resp.Body.Close()
-		
-		if resp.StatusCode >= 400 {
-			return nil, "", fmt.Errorf("status %d", resp.StatusCode)
-		}
-		
-		reader, err := charset.NewReader(resp.Body, resp.Header.Get("Content-Type"))
-		if err != nil {
-			reader = resp.Body
-		}
-		
-		body, err := io.ReadAll(io.LimitReader(reader, 10*1024*1024))
-		if err != nil {
-			lastErr = err
-			if attempt < dc.config.RetryAttempts {
-				time.Sleep(time.Second * time.Duration(attempt))
-				continue
-			}
-			return nil, "", err
-		}
-		
-		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
-		if err != nil {
-			return nil, "", err
-		}
-		
-		return doc, resp.Request.URL.String(), nil
-	}
-	
-	return nil, "", lastErr
-}
-
-// detectStructuredData - обнаруживает комментарии через Schema.org и JSON-LD
-func (dc *DomainCrawler) detectStructuredData(doc *goquery.Document, url string) *Finding {
-	score := 0.0
-	signals := []string{}
-	
-	// 1. Проверяем Schema.org микроразметку
-	schemaComments := doc.Find("[itemtype*='schema.org/Comment'], [itemtype*='schema.org/UserComments']")
-	if schemaComments.Length() > 0 {
-		score += 0.9
-		signals = append(signals, "schema_org_comment")
-	}
-	
-	// 2. Проверяем JSON-LD структуры
-	doc.Find("script[type='application/ld+json']").Each(func(i int, s *goquery.Selection) {
-		jsonText := s.Text()
-		if strings.Contains(jsonText, "\"@type\":\"Comment\"") ||
-		   strings.Contains(jsonText, "\"@type\":\"UserComments\"") ||
-		   strings.Contains(jsonText, "\"@type\":\"DiscussionForumPosting\"") ||
-		   strings.Contains(jsonText, "\"comment\":") ||
-		   strings.Contains(jsonText, "\"commentCount\":") {
-			score += 0.85
-			signals = append(signals, "json_ld_comment")
-		}
-		
-		// Проверяем тип статьи
-		if strings.Contains(jsonText, "\"@type\":\"Article\"") ||
-		   strings.Contains(jsonText, "\"@type\":\"BlogPosting\"") ||
-		   strings.Contains(jsonText, "\"@type\":\"NewsArticle\"") {
-			score += 0.3
-			signals = append(signals, "article_context")
-		}
-	})
-	
-	// 3. Open Graph метатеги
-	doc.Find("meta[property^='og:']").Each(func(i int, s *goquery.Selection) {
-		prop, _ := s.Attr("property")
-		content, _ := s.Attr("content")
-		
-		if prop == "og:type" {
-			if strings.Contains(content, "article") || 
-			   strings.Contains(content, "blog") ||
-			   strings.Contains(content, "website") {
-				score += 0.2
-				signals = append(signals, "og_type_article")
-			}
-		}
-	})
-	
-	// 4. Микроформаты
-	if doc.Find(".h-entry, .h-card, .e-content, .p-comment").Length() > 0 {
-		score += 0.3
-		signals = append(signals, "microformats")
-	}
-	
-	// 5. WordPress/CMS классы
-	wpIndicators := []string{
-		".wp-comment", ".wp-comment-author", 
-		"#wp-comment-cookies-consent",
-		".comment-metadata", ".comment-awaiting-moderation",
-		".comment-edit-link", ".comment-reply-link",
-		".comments-area", ".comment-list",
-		".commentlist", ".comment-navigation",
-	}
-	
-	wpScore := 0.0
-	for _, indicator := range wpIndicators {
-		if doc.Find(indicator).Length() > 0 {
-			wpScore += 0.15
-			if wpScore == 0.15 { // Добавляем сигнал только один раз
-				signals = append(signals, "wordpress_comments")
-			}
-		}
-	}
-	score += math.Min(wpScore, 0.6) // Максимум 0.6 от WordPress
-	
-	// 6. Drupal индикаторы
-	drupalIndicators := []string{
-		".comment-wrapper", ".comment-permalink",
-		".comment-submitted", ".comment-user-",
-		"#comments", ".indented",
-	}
-	
-	drupalScore := 0.0
-	for _, indicator := range drupalIndicators {
-		if doc.Find(indicator).Length() > 0 {
-			drupalScore += 0.1
-			if drupalScore == 0.1 {
-				signals = append(signals, "drupal_comments")
-			}
-		}
-	}
-	score += math.Min(drupalScore, 0.4)
-	
-	// 7. Проверяем data-атрибуты
-	doc.Find("[data-comment], [data-comments], [data-comment-id], [data-comment-count]").Each(func(i int, s *goquery.Selection) {
-		score += 0.1
-		if i == 0 {
-			signals = append(signals, "data_attributes")
-		}
-	})
-	
-	if score > 0.5 {
-		return &Finding{
-			Domain:     dc.domain,
-			URL:        url,
-			Method:     "structured_data",
-			System:     "schema_org",
-			Confidence: math.Min(score, 1.0),
-			Signals:    signals,
-			Timestamp:  time.Now(),
-		}
-	}
-	
-	return nil
-}
-
-// ENHANCED detectComments with structured data
-func (dc *DomainCrawler) detectComments(doc *goquery.Document, url string) *Finding {
-	var bestFinding *Finding
-	maxConfidence := 0.0
-	
-	// Предварительный анализ контекста страницы
-	pageContext := analyzePageStructure(doc)
-	_, urlWeight := analyzeURLContext(url)
-	
-	// 1. Check modern comment systems (highest priority)
-	if finding := dc.detectModernSystems(doc, url); finding != nil {
-		finding.PageContext = pageContext
-		finding.URLWeight = urlWeight
-		if finding.Confidence > maxConfidence {
-			bestFinding = finding
-			maxConfidence = finding.Confidence
-		}
-	}
-	
-	// 2. Check structured data - только если не нашли modern system с высокой confidence
-	if maxConfidence < 0.9 {
-		if finding := dc.detectStructuredData(doc, url); finding != nil {
-			finding.PageContext = pageContext
-			finding.URLWeight = urlWeight
-			if finding.Confidence > maxConfidence {
-				bestFinding = finding
-				maxConfidence = finding.Confidence
-			}
-		}
-	}
-	
-	// 3. Check native forms - только если не нашли надежную систему
-	if maxConfidence < 0.8 {
-		if finding := dc.detectNativeFormsEnhanced(doc, url, pageContext, urlWeight); finding != nil {
-			if finding.Confidence > maxConfidence {
-				bestFinding = finding
-				maxConfidence = finding.Confidence
-			}
-		}
-	}
-	
-	// 4. Check AJAX/dynamic systems
-	if maxConfidence < 0.7 {
-		if finding := dc.detectDynamicSystems(doc, url); finding != nil {
-			finding.PageContext = pageContext
-			finding.URLWeight = urlWeight
-			if finding.Confidence > maxConfidence {
-				bestFinding = finding
-				maxConfidence = finding.Confidence
-			}
-		}
-	}
-	
-	// 5. Check placeholders - только как последний вариант
-	if maxConfidence < 0.5 && (pageContext > 0.2 || urlWeight > 0.1) {
-		if finding := dc.detectPlaceholdersEnhanced(doc, url, pageContext); finding != nil {
-			finding.URLWeight = urlWeight
-			if finding.Confidence > maxConfidence {
-				bestFinding = finding
-				maxConfidence = finding.Confidence
-			}
-		}
-	}
-	
-	return bestFinding
-}
-
-func (dc *DomainCrawler) detectModernSystems(doc *goquery.Document, url string) *Finding {
-	systems := map[string][]string{
-		// Популярные системы
-		"disqus": {
-			"#disqus_thread", ".disqus", "disqus.com/embed",
-			"disqus_config", "dsq-", "disqus-comment",
-		},
-		"facebook": {
-			".fb-comments", "#fb-root", "facebook.com/plugins/comments",
-			"fb:comments", "class=\"fb-comments\"",
-		},
-		"vk": {
-			"#vk_comments", ".vk_comments", "VK.Widgets.Comments",
-			"vk.com/widget_comments", "vk_comments",
-		},
-		"wordpress": {
-			"#commentform", "#respond", ".comment-respond",
-			"comment-reply-link", "wp-comment", "wp-comment-",
-			"wordpress-comment", "#comments-title",
-		},
-		
-		// Новые и self-hosted системы
-		"commento": {
-			"#commento", ".commento", "commento.io",
-			"commento-root", "data-commento",
-		},
-		"utterances": {
-			".utterances", "utterances-frame", "utteranc.es",
-		},
-		"giscus": {
-			".giscus", "giscus-frame", "giscus.app",
-		},
-		"remark42": {
-			"#remark42", ".remark42", "remark42__root",
-		},
-		"hyvor": {
-			"hyvor-talk", "talk.hyvor.com", "hyvor-talk-comments",
-		},
-		"cusdis": {
-			"#cusdis_thread", ".cusdis", "cusdis.com",
-			"data-host=\"cusdis", "cusdis-root",
-		},
-		"waline": {
-			"#waline", ".waline", "waline-comment",
-			"waline.js", "@waline/client",
-		},
-		"twikoo": {
-			"#twikoo", ".twikoo", "twikoo-container",
-			"twikoo.js", "twikoo-comment",
-		},
-		"artalk": {
-			"#artalk", ".artalk", "artalk-comment",
-			"artalk.js", "artalk-container",
-		},
-		"isso": {
-			"#isso-thread", ".isso-comment", "data-isso",
-			"isso-postbox", "embed.min.js",
-		},
-		"schnack": {
-			".schnack-comments", "#schnack-comments",
-			"schnack.js", "data-schnack",
-		},
-		
-		// Региональные системы
-		"livere": {
-			"#lv-container", ".livere", "livere.com",
-			"livere-comment", "city.livere.com",
-		},
-		"hypercomments": {
-			"#hypercomments_widget", "hypercomments.com",
-			".hc-comment", "hypercomments_mix",
-		},
-		"yandex": {
-			"ya-comments", "yandex.ru/comments",
-			"yandex-comments-widget",
-		},
-		
-		// CMS-специфичные
-		"drupal": {
-			"#comments", ".comment-wrapper", "drupal-comment",
-			".comment-form", "#comment-form",
-		},
-		"joomla": {
-			"#jcomments", ".jcomments", "com_jcomments",
-		},
-		"ghost": {
-			"#ghost-comments", ".ghost-comments", "data-ghost-comment",
-		},
-		
-		// React/Vue компоненты (по паттернам)
-		"react_comments": {
-			"data-reactroot", "__react-comment", "react-comment-",
-			"CommentSection", "CommentBox", "CommentList",
-		},
-		"vue_comments": {
-			"v-comment", "vue-comment", "comment-component",
-			"data-v-", "_comment_", "__vue__",
-		},
-		
-		// Другие
-		"telegram": {
-			".telegram-comments", "comments.app", "tg-comments",
-		},
-		"coral": {
-			"coral-embed-stream", "coral-comment", "coralproject",
-		},
-		"cackle": {
-			"#mc-container", ".cackle_widget", "cackle.me",
-			"cackle-comment", "mc-comment",
-		},
-		"muut": {
-			".muut", "#muut", "muut.com", "muut-widget",
-		},
-		"spot.im": {
-			"spot-im", "spotim", "spot-im-frame",
-			"data-spot-im", "spotim_launcher",
-		},
-	}
-	
-	html, _ := doc.Html()
-	htmlLower := strings.ToLower(html)
-	
-	for system, patterns := range systems {
-		for _, pattern := range patterns {
-			if strings.Contains(htmlLower, pattern) ||
-			   doc.Find(pattern).Length() > 0 {
-				return &Finding{
-					Domain:     dc.domain,
-					URL:        url,
-					Method:     "modern_system",
-					System:     system,
-					Confidence: 0.95,
-					Signals:    []string{system + "_detected", "modern_system"},
-					Timestamp:  time.Now(),
-				}
-			}
-		}
-	}
-	
-	return nil
-}
-
-// ENHANCED native form detection
-func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url string, pageContext, urlWeight float64) *Finding {
-	var bestFinding *Finding
-	maxScore := 0.0
-	
-	// Фиксированный базовый порог с бонусом за хороший контекст
-	minThreshold := 0.3
-	if pageContext > 0.3 || urlWeight > 0.2 {
-		// Хороший контекст СНИЖАЕТ требования, а не повышает
-		minThreshold = 0.25  
-	}
-	
-	doc.Find("form").Each(func(i int, form *goquery.Selection) {
-		textareas := form.Find("textarea")
-		if textareas.Length() == 0 {
-			return
-		}
-		
-		// Пропускаем явные поисковые формы
-		if form.Find("input[type='search']").Length() > 0 ||
-		   form.Find("input[name='q']").Length() > 0 ||
-		   form.Find("input[name='s']").Length() > 0 {
-			return
-		}
-		
-		// Семантический анализ формы
-		formSemantics := analyzeFormSemantics(form, doc)
-		
-		// Комбинированная оценка
-		score := 0.0
-		signals := []string{}
-		
-		// Базовая оценка от контекста
-		score += pageContext * 0.3
-		score += urlWeight * 0.2
-		score += formSemantics * 0.5
-		
-		// УЛУЧШЕННАЯ ЭВРИСТИКА для нестандартных имён полей
-		
-		// Анализ textarea - расширенный список паттернов
-		textareaPatterns := []struct{
-			patterns []string
-			weight float64
-			signal string
-		}{
-			{[]string{"comment", "reply", "response"}, 0.35, "textarea_comment"},
-			{[]string{"message", "msg", "text", "content", "body"}, 0.25, "textarea_message"},
-			{[]string{"review", "feedback", "opinion"}, 0.2, "textarea_review"},
-			{[]string{"post", "entry", "note"}, 0.15, "textarea_post"},
-			{[]string{"description", "desc", "details"}, 0.1, "textarea_description"},
-		}
-		
-		textareaAnalyzed := false
-		textareas.Each(func(j int, ta *goquery.Selection) {
-			if textareaAnalyzed {
-				return
-			}
-			
-			// Собираем все атрибуты для анализа
-			name := strings.ToLower(ta.AttrOr("name", ""))
-			id := strings.ToLower(ta.AttrOr("id", ""))
-			placeholder := strings.ToLower(ta.AttrOr("placeholder", ""))
-			className := strings.ToLower(ta.AttrOr("class", ""))
-			ariaLabel := strings.ToLower(ta.AttrOr("aria-label", ""))
-			
-			combined := name + " " + id + " " + placeholder + " " + className + " " + ariaLabel
-			
-			// Проверяем паттерны
-			for _, pattern := range textareaPatterns {
-				for _, p := range pattern.patterns {
-					if strings.Contains(combined, p) {
-						score += pattern.weight
-						signals = append(signals, pattern.signal)
-						textareaAnalyzed = true
-						break
-					}
-				}
-				if textareaAnalyzed {
-					break
-				}
-			}
-		})
-		
-		// Анализ других полей формы - улучшенная эвристика
-		fields := form.Find("input[type!='hidden'], select")
-		fieldSignatures := make(map[string]bool)
-		fieldTypes := make(map[string]int)
-		
-		fields.Each(func(j int, field *goquery.Selection) {
-			fieldType := strings.ToLower(field.AttrOr("type", "text"))
-			name := strings.ToLower(field.AttrOr("name", ""))
-			placeholder := strings.ToLower(field.AttrOr("placeholder", ""))
-			
-			// Создаём сигнатуру поля
-			combined := name + " " + placeholder
-			
-			// Классифицируем поля
-			if fieldType == "email" || strings.Contains(combined, "email") || strings.Contains(combined, "mail") {
-				fieldSignatures["email"] = true
-				fieldTypes["email"]++
-			}
-			if strings.Contains(combined, "name") || strings.Contains(combined, "author") || 
-			   strings.Contains(combined, "nick") || strings.Contains(combined, "user") {
-				fieldSignatures["name"] = true
-				fieldTypes["name"]++
-			}
-			if fieldType == "url" || strings.Contains(combined, "website") || 
-			   strings.Contains(combined, "site") || strings.Contains(combined, "url") {
-				fieldSignatures["website"] = true
-				fieldTypes["website"]++
-			}
-			if fieldType == "tel" || strings.Contains(combined, "phone") || 
-			   strings.Contains(combined, "tel") || strings.Contains(combined, "mobile") {
-				fieldSignatures["phone"] = true
-				fieldTypes["phone"]++
-			}
-			if strings.Contains(combined, "subject") || strings.Contains(combined, "title") ||
-			   strings.Contains(combined, "topic") {
-				fieldSignatures["subject"] = true
-				fieldTypes["subject"]++
-			}
-			if strings.Contains(combined, "company") || strings.Contains(combined, "organization") ||
-			   strings.Contains(combined, "business") {
-				fieldSignatures["company"] = true
-				fieldTypes["company"]++
-			}
-		})
-		
-		// УЛУЧШЕННАЯ ЛОГИКА: Паттерны комбинаций полей
-		
-		// Паттерн 1: Классический комментарий (name + email + [website])
-		if fieldSignatures["name"] && fieldSignatures["email"] && !fieldSignatures["phone"] && !fieldSignatures["subject"] {
-			score += 0.35
-			signals = append(signals, "classic_comment_fields")
-			if fieldSignatures["website"] {
-				score += 0.1
-				signals = append(signals, "has_website")
-			}
-		}
-		
-		// Паттерн 2: Минималистичный комментарий (только email или name)
-		if (fieldSignatures["email"] || fieldSignatures["name"]) && 
-		   !fieldSignatures["phone"] && !fieldSignatures["subject"] && !fieldSignatures["company"] {
-			score += 0.2
-			signals = append(signals, "minimal_comment_fields")
-		}
-		
-		// Паттерн 3: Анонимный комментарий (только textarea)
-		if len(fieldSignatures) == 0 && textareas.Length() == 1 {
-			score += 0.15
-			signals = append(signals, "anonymous_comment")
-		}
-		
-		// Негативные паттерны (контактная форма)
-		if fieldSignatures["phone"] {
-			score -= 0.4
-			signals = append(signals, "has_phone")
-		}
-		if fieldSignatures["subject"] {
-			score -= 0.25
-			signals = append(signals, "has_subject")
-		}
-		if fieldSignatures["company"] {
-			score -= 0.3
-			signals = append(signals, "has_company")
-		}
-		
-		// Проверка кнопки submit - расширенный список
-		submitButtons := form.Find("button[type='submit'], input[type='submit'], button:not([type='button'])")
-		submitText := ""
-		submitButtons.Each(func(j int, btn *goquery.Selection) {
-			submitText += " " + strings.ToLower(btn.Text() + " " + btn.AttrOr("value", ""))
-		})
-		
-		submitPatterns := []struct{
-			patterns []string
-			weight float64
-			signal string
-		}{
-			{[]string{"post comment", "add comment", "submit comment", "leave comment"}, 0.3, "button_comment"},
-			{[]string{"reply", "respond", "answer"}, 0.25, "button_reply"},
-			{[]string{"send", "submit", "post", "publish"}, 0.1, "button_generic"},
-			{[]string{"contact", "inquiry", "get in touch"}, -0.3, "button_contact"},
-		}
-		
-		for _, pattern := range submitPatterns {
-			for _, p := range pattern.patterns {
-				if strings.Contains(submitText, p) {
-					score += pattern.weight
-					signals = append(signals, pattern.signal)
-					break
-				}
-			}
-		}
-		
-		// Проверка контекста формы
-		if form.Closest("article, .article, .post, .entry, .content-area, #content, main").Length() > 0 {
-			score += 0.15
-			signals = append(signals, "in_article")
-		}
-		
-		// Проверка на существующие комментарии поблизости
-		parent := form.Parent()
-		for i := 0; i < 3; i++ { // Проверяем 3 уровня вверх
-			if parent.Find(".comment, #comments, .discussion, .responses").Length() > 0 {
-				score += 0.2
-				signals = append(signals, "existing_comments_nearby")
-				break
-			}
-			parent = parent.Parent()
-		}
-		
-		// Проверка сложности формы
-		totalFields := fields.Length() + textareas.Length()
-		if totalFields <= 4 {
-			score += 0.1
-			signals = append(signals, "simple_form")
-		} else if totalFields > 7 {
-			score -= 0.15
-			signals = append(signals, "complex_form")
-		}
-		
-		if pageContext > 0.3 {
-			signals = append(signals, "good_page_context")
-		}
-		if urlWeight > 0.2 {
-			signals = append(signals, "content_url")
-		}
-		if formSemantics > 0.3 {
-			signals = append(signals, "comment_form_semantics")
-		}
-		
-		// Финальная проверка
-		if score > minThreshold && score > maxScore {
-			maxScore = score
-			bestFinding = &Finding{
-				Domain:        dc.domain,
-				URL:           url,
-				Method:        "native_form",
-				System:        "native",
-				Confidence:    math.Min(score, 1.0),
-				HasTextarea:   true,
-				TextareaCount: textareas.Length(),
-				Signals:       signals,
-				Timestamp:     time.Now(),
-				PageContext:   pageContext,
-				URLWeight:     urlWeight,
-				FormSemantics: formSemantics,
-			}
-		}
-	})
-	
-	return bestFinding
-}
-
-func (dc *DomainCrawler) detectDynamicSystems(doc *goquery.Document, url string) *Finding {
-	html, _ := doc.Html()
-	
-	ajaxPatterns := []string{
-		"loadComments", "fetchComments", "getComments",
-		"ajax.*comment", "comment.*ajax",
-		"comments-container", "comments-wrapper",
-		"data-comments", "data-discussion-url",
-		"discussionUrl", "commentsEndpoint",
-	}
-	
-	for _, pattern := range ajaxPatterns {
-		re := regexp.MustCompile(`(?i)` + pattern)
-		if re.MatchString(html) {
-			return &Finding{
-				Domain:     dc.domain,
-				URL:        url,
-				Method:     "dynamic_system",
-				System:     "ajax",
-				Confidence: 0.7,
-				Signals:    []string{pattern, "ajax_loader"},
-				Timestamp:  time.Now(),
-			}
-		}
-	}
-	
-	return nil
-}
-
-// ENHANCED placeholder detection
-func (dc *DomainCrawler) detectPlaceholdersEnhanced(doc *goquery.Document, url string, pageContext float64) *Finding {
-	// Требуем минимальный контекст страницы
-	if pageContext < 0.1 {
-		return nil
-	}
-	
-	text := strings.ToLower(doc.Text())
-	
-	// Проверяем наличие формы или места для комментариев
-	hasCommentArea := doc.Find("form textarea, #comments, .comments, .discussion").Length() > 0
-	if !hasCommentArea {
-		return nil
-	}
-	
-	placeholders := map[string]float64{
-		"no comments yet":          0.5,
-		"be the first to comment":  0.5,
-		"0 comments":               0.4,
-		"leave a comment":          0.4,
-		"нет комментариев":         0.5,
-		"комментариев пока нет":    0.5,
-		"будьте первым":           0.4,
-		"оставить комментарий":     0.4,
-		"start the discussion":     0.5,
-		"join the conversation":    0.4,
-	}
-	
-	for placeholder, baseConfidence := range placeholders {
-		if strings.Contains(text, placeholder) {
-			// Корректируем confidence на основе контекста
-			adjustedConfidence := baseConfidence + pageContext*0.2
-			
-			return &Finding{
-				Domain:      dc.domain,
-				URL:         url,
-				Method:      "placeholder",
-				System:      "placeholder",
-				Confidence:  math.Min(adjustedConfidence, 0.8),
-				Signals:     []string{placeholder, "has_comment_area"},
-				Timestamp:   time.Now(),
-				PageContext: pageContext,
-			}
-		}
-	}
-	
-	return nil
-}
-
-func (dc *DomainCrawler) extractLinks(doc *goquery.Document, baseURL string) []string {
-	base, _ := url.Parse(baseURL)
-	links := make(map[string]bool)
-	
-	doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
-		href, exists := s.Attr("href")
-		if !exists || href == "" {
-			return
-		}
-		
-		u, err := url.Parse(href)
-		if err != nil {
-			return
-		}
-		
-		absolute := base.ResolveReference(u)
-		
-		if absolute.Host != dc.domain && absolute.Host != "www."+dc.domain {
-			return
-		}
-		
-		absolute.Fragment = ""
-		absolute.RawQuery = cleanQuery(absolute.Query())
-		
-		path := strings.ToLower(absolute.Path)
-		skipExts := []string{
-			".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
-			".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-			".zip", ".rar", ".7z", ".tar", ".gz",
-			".mp3", ".mp4", ".avi", ".mov", ".wmv", ".flv",
-			".js", ".css", ".xml", ".json", ".txt",
-			".woff", ".woff2", ".ttf", ".eot",
-		}
-		for _, ext := range skipExts {
-			if strings.HasSuffix(path, ext) {
-				return
-			}
-		}
-		
-		skipPaths := []string{
-			"/wp-admin", "/admin", "/cgi-bin", "/scripts",
-			"/wp-includes", "/wp-content/uploads", "/assets",
-			"/.well-known", "/api/", "/feed", "/rss",
-		}
-		for _, skip := range skipPaths {
-			if strings.Contains(path, skip) {
-				return
-			}
-		}
-		
-		links[absolute.String()] = true
-	})
-	
-	result := make([]string, 0, len(links))
-	for link := range links {
-		result = append(result, link)
-	}
-	
-	return result
-}
-
-func (dc *DomainCrawler) prioritizeLinks(links []string) []string {
-	type scoredLink struct {
-		url   string
-		score int
-	}
-	
-	scored := make([]scoredLink, 0, len(links))
-	
-	for _, link := range links {
-		score := 50
-		lower := strings.ToLower(link)
-		
-		// High priority
-		if strings.Contains(lower, "comment") ||
-		   strings.Contains(lower, "discuss") ||
-		   strings.Contains(lower, "review") ||
-		   strings.Contains(lower, "forum") {
-			score += 40
-		}
-		
-		if strings.Contains(lower, "blog") ||
-		   strings.Contains(lower, "article") ||
-		   strings.Contains(lower, "post") ||
-		   strings.Contains(lower, "news") {
-			score += 30
-		}
-		
-		if regexp.MustCompile(`/202[34]/`).MatchString(lower) {
-			score += 20
-		}
-		
-		// Low priority
-		if strings.Contains(lower, "contact") ||
-		   strings.Contains(lower, "about") ||
-		   strings.Contains(lower, "privacy") ||
-		   strings.Contains(lower, "terms") ||
-		   strings.Contains(lower, "login") {
-			score -= 20
-		}
-		
-		scored = append(scored, scoredLink{url: link, score: score})
-	}
-	
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
-	})
-	
-	result := make([]string, len(scored))
-	for i, sl := range scored {
-		result[i] = sl.url
-	}
-	
-	return result
-}
-
-// extractDateFromPage - извлекает дату публикации со страницы
-func extractDateFromPage(doc *goquery.Document) (year int, month int, confidence float64) {
-	currentYear := time.Now().Year()
-	year, month = 0, 0
-	confidence = 0.0
-	
-	// 1. Проверяем meta теги (самый надежный источник)
-	doc.Find("meta").Each(func(i int, s *goquery.Selection) {
-		property, _ := s.Attr("property")
-		name, _ := s.Attr("name")
-		content, _ := s.Attr("content")
-		
-		// Open Graph и Schema.org даты
-		if property == "article:published_time" || 
-		   property == "article:modified_time" ||
-		   name == "publish_date" ||
-		   name == "date" {
-			if t, err := time.Parse(time.RFC3339, content); err == nil {
-				year = t.Year()
-				month = int(t.Month())
-				confidence = 0.9
-				return
-			}
-			// Пробуем другие форматы
-			if t, err := time.Parse("2006-01-02", content); err == nil {
-				year = t.Year()
-				month = int(t.Month())
-				confidence = 0.9
-				return
-			}
-		}
-	})
-	
-	if confidence > 0 {
-		return
-	}
-	
-	// 2. Проверяем time элементы
-	doc.Find("time[datetime]").Each(func(i int, s *goquery.Selection) {
-		datetime, exists := s.Attr("datetime")
-		if !exists {
-			return
-		}
-		
-		if t, err := time.Parse(time.RFC3339, datetime); err == nil {
-			year = t.Year()
-			month = int(t.Month())
-			confidence = 0.8
-			return
-		}
-		if t, err := time.Parse("2006-01-02", datetime); err == nil {
-			year = t.Year()
-			month = int(t.Month())
-			confidence = 0.8
-			return
-		}
-	})
-	
-	if confidence > 0 {
-		return
-	}
-	
-	// 3. Ищем даты в тексте (менее надежно)
-	datePatterns := []struct {
-		regex *regexp.Regexp
-		conf  float64
-	}{
-		{regexp.MustCompile(`(\d{4})-(\d{1,2})-\d{1,2}`), 0.6},
-		{regexp.MustCompile(`(\d{1,2})/(\d{1,2})/(\d{4})`), 0.5},
-		{regexp.MustCompile(`(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+(\d{4})`), 0.5},
-	}
-	
-	doc.Find(".date, .post-date, .entry-date, .published, .timestamp").Each(func(i int, s *goquery.Selection) {
-		text := s.Text()
-		for _, p := range datePatterns {
-			if matches := p.regex.FindStringSubmatch(text); len(matches) > 0 {
-				// Простая логика извлечения года
-				for _, match := range matches {
-					if y, err := strconv.Atoi(match); err == nil && y > 2000 && y <= currentYear {
-						year = y
-						confidence = p.conf
-						return
-					}
-				}
-			}
-		}
-	})
-	
-	return
-}
-
-// extractURLPattern - извлекает паттерн из URL для обучения
-func extractURLPattern(urlStr string) string {
-	u, err := url.Parse(urlStr)
+	// Извлечение ссылок
+	baseURL, _ := url.Parse(item.URL)
+	links, err := extractLinks(body, baseURL, dc.domain)
 	if err != nil {
-		return ""
-	}
-	
-	path := u.Path
-	// Заменяем числа на плейсхолдеры для обобщения паттерна
-	// /2024/12/article-name -> /{year}/{month}/article-name
-	path = regexp.MustCompile(`/\d{4}/`).ReplaceAllString(path, "/{year}/")
-	path = regexp.MustCompile(`/\d{1,2}/`).ReplaceAllString(path, "/{num}/")
-	path = regexp.MustCompile(`-\d+`).ReplaceAllString(path, "-{id}")
-	path = regexp.MustCompile(`/\d+$`).ReplaceAllString(path, "/{id}")
-	
-	return path
-}
-
-// learnFromSuccess - запоминает успешный паттерн
-func (dc *DomainCrawler) learnFromSuccess(url string) {
-	pattern := extractURLPattern(url)
-	if pattern == "" {
-		return
-	}
-	
-	// Увеличиваем счетчик для этого паттерна
-	if count, ok := dc.patternCounts.Load(pattern); ok {
-		dc.patternCounts.Store(pattern, count.(int)+1)
+		dc.logger.Trace("extract links failed", map[string]interface{}{
+			"domain": dc.domain,
+			"url":    item.URL,
+			"error":  err.Error(),
+		})
 	} else {
-		dc.patternCounts.Store(pattern, 1)
+		dc.enqueueLinks(links, item.Depth+1)
 	}
 	
-	// Запоминаем URL как успешный
-	dc.successPatterns.Store(url, true)
-	
-	log.Printf("[%s] Learned pattern: %s (count: %d)", dc.domain, pattern, dc.getPatternCount(pattern))
-}
-
-// getPatternCount - получает счетчик для паттерна
-func (dc *DomainCrawler) getPatternCount(pattern string) int {
-	if count, ok := dc.patternCounts.Load(pattern); ok {
-		return count.(int)
-	}
-	return 0
-}
-
-// scoreByPattern - оценивает URL на основе изученных паттернов
-func (dc *DomainCrawler) scoreByPattern(url string) int {
-	pattern := extractURLPattern(url)
-	if pattern == "" {
-		return 0
-	}
-	
-	count := dc.getPatternCount(pattern)
-	
-	// Чем чаще находили комментарии по этому паттерну, тем выше приоритет
-	switch {
-	case count >= 10:
-		return 100 // Очень успешный паттерн
-	case count >= 5:
-		return 70
-	case count >= 2:
-		return 40
-	case count == 1:
-		return 20
-	default:
-		return 0
+	// Детекция комментариев
+	finding, detected := detectComments(body, metadata)
+	if detected {
+		finding.Domain = dc.domain
+		tier, label := classifyFindingTier(finding.Confidence, finding.Signals)
+		finding.Tier = tier
+		finding.TierLabel = label
+		
+		// Запись результата
+		if err := dc.resultWriter.WriteFinding(*finding); err != nil {
+			dc.logger.Warn("failed to write finding", map[string]interface{}{
+				"domain": dc.domain,
+				"url":    item.URL,
+				"error":  err.Error(),
+			})
+		} else {
+			atomic.AddInt64(&dc.found, 1)
+			dc.prioritizer.RecordSuccess(item.URL)
+			
+			dc.logger.Info("found comments", map[string]interface{}{
+				"domain":     dc.domain,
+				"url":        item.URL,
+				"tier":       tier,
+				"tier_label": label,
+				"confidence": finding.Confidence,
+			})
+		}
 	}
 }
 
-// prioritizeLinksByFreshnessEnhanced - улучшенная приоритизация с извлечением дат из контента
-func (dc *DomainCrawler) prioritizeLinksByFreshnessEnhanced(links []string, currentDoc *goquery.Document) []string {
-	type scoredLink struct {
-		url           string
-		score         int
-		year          int
-		month         int
-		confidence    float64
-		patternScore  int  // NEW: оценка на основе успешных паттернов
-	}
-	
-	scored := make([]scoredLink, 0, len(links))
-	currentYear := time.Now().Year()
-	currentMonth := int(time.Now().Month())
-	
-	// Регулярные выражения для дат в URL
-	yearMonthRegex := regexp.MustCompile(`/(\d{4})/(\d{1,2})/`)
-	yearOnlyRegex := regexp.MustCompile(`/(\d{4})/`)
-	
-	// Если можем, извлекаем дату текущей страницы для контекста
-	pageYear, _, _ := extractDateFromPage(currentDoc)
-	
-	// Считаем сколько успешных находок уже было
-	foundCount := atomic.LoadInt64(&dc.found)
+func (dc *DomainCrawler) enqueueLinks(links []string, depth int) {
+	// Батчевая обработка
+	batch := make([]URLItem, 0, len(links))
 	
 	for _, link := range links {
-		sl := scoredLink{url: link, score: 50}
-		lower := strings.ToLower(link)
-		
-		// НОВОЕ: Оцениваем на основе изученных паттернов
-		sl.patternScore = dc.scoreByPattern(link)
-		sl.score += sl.patternScore
-		
-		// Извлекаем дату из URL
-		if matches := yearMonthRegex.FindStringSubmatch(link); len(matches) > 2 {
-			sl.year, _ = strconv.Atoi(matches[1])
-			sl.month, _ = strconv.Atoi(matches[2])
-			sl.confidence = 0.7
-		} else if matches := yearOnlyRegex.FindStringSubmatch(link); len(matches) > 1 {
-			sl.year, _ = strconv.Atoi(matches[1])
-			sl.confidence = 0.5
-		}
-		
-		// Оцениваем свежесть (не исключаем старые!)
-		if sl.year > 0 {
-			yearDiff := currentYear - sl.year
-			
-			switch {
-			case yearDiff == 0: // Текущий год
-				sl.score += 100
-				if sl.month >= currentMonth-2 {
-					sl.score += 50 // Последние 2 месяца
-				}
-			case yearDiff == 1: // Прошлый год
-				sl.score += 70
-			case yearDiff <= 2: // 2 года
-				sl.score += 50
-			case yearDiff <= 5: // До 5 лет
-				sl.score += 20
-			case yearDiff <= 10: // До 10 лет
-				sl.score += 5
-			default: // Старше 10 лет
-				sl.score += 0 // НЕ штрафуем старый контент
-			}
-		} else if pageYear > 0 {
-			// Если не знаем дату ссылки, используем дату страницы как подсказку
-			yearDiff := currentYear - pageYear
-			if yearDiff <= 1 {
-				sl.score += 30
-			}
-		}
-		
-		// Дополнительные индикаторы
-		if strings.Contains(lower, "comment") || strings.Contains(lower, "discuss") {
-			sl.score += 30
-		}
-		if strings.Contains(lower, "blog") || strings.Contains(lower, "article") || 
-		   strings.Contains(lower, "post") || strings.Contains(lower, "news") {
-			sl.score += 20
-		}
-		
-		// После первых 20 находок снижаем штраф для агрегаторов
-		// (может там тоже есть комментарии)
-		penaltyReduction := 0
-		if foundCount > 20 {
-			penaltyReduction = 10
-		}
-		
-		if strings.Contains(lower, "/page/") || strings.Contains(lower, "/tag/") ||
-		   strings.Contains(lower, "/category/") || strings.Contains(lower, "/archive/") {
-			sl.score -= (30 - penaltyReduction) // Адаптивный штраф
-		}
-		
-		scored = append(scored, sl)
-	}
-	
-	// Сортируем по score, потом по паттерну, потом по дате
-	sort.Slice(scored, func(i, j int) bool {
-		if scored[i].score != scored[j].score {
-			return scored[i].score > scored[j].score
-		}
-		if scored[i].patternScore != scored[j].patternScore {
-			return scored[i].patternScore > scored[j].patternScore
-		}
-		if scored[i].year != scored[j].year {
-			return scored[i].year > scored[j].year
-		}
-		return scored[i].month > scored[j].month
-	})
-	
-	// Логируем топ-5 для отладки (только если нашли что-то интересное)
-	if len(scored) > 0 && scored[0].patternScore > 0 {
-		log.Printf("[%s] Top prioritized URLs (pattern learning active):", dc.domain)
-		for i := 0; i < 5 && i < len(scored); i++ {
-			log.Printf("  [%d] Score:%d Pattern:%d Year:%d URL:%s", 
-				i+1, scored[i].score, scored[i].patternScore, scored[i].year, scored[i].url)
-		}
-	}
-	
-	result := make([]string, len(scored))
-	for i, sl := range scored {
-		result[i] = sl.url
-	}
-	
-	return result
-}
-
-func (dc *DomainCrawler) processSitemap() {
-	// Пробуем несколько вариантов sitemap
-	sitemapURLs := []string{
-		"https://" + dc.domain + "/sitemap.xml",
-		"https://" + dc.domain + "/sitemap_index.xml", 
-		"https://" + dc.domain + "/sitemap1.xml",
-		"https://" + dc.domain + "/post-sitemap.xml",
-		"https://" + dc.domain + "/page-sitemap.xml",
-		"http://" + dc.domain + "/sitemap.xml",
-	}
-	
-	allLinks := make([]string, 0, 1000)
-	
-	for _, sitemapURL := range sitemapURLs {
-		req, err := http.NewRequestWithContext(dc.ctx, "GET", sitemapURL, nil)
-		if err != nil {
+		if dc.visited.Contains(link) {
 			continue
 		}
 		
-		ua := dc.config.UserAgents[rand.Intn(len(dc.config.UserAgents))]
-		req.Header.Set("User-Agent", ua)
-		
-		resp, err := dc.client.Do(req)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-		
-		if resp.StatusCode != 200 {
-			continue
+		priority := dc.prioritizer.PrioritizeLink(link, depth)
+		item := URLItem{
+			URL:      link,
+			Priority: priority,
+			Depth:    depth,
 		}
 		
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024)) // Увеличил до 5MB
-		if err != nil {
-			continue
-		}
-		
-		// Парсим sitemap
-		if strings.Contains(string(body), "<sitemapindex") {
-			// Это индексный файл - извлекаем вложенные sitemap
-			re := regexp.MustCompile(`<loc>([^<]+)</loc>`)
-			matches := re.FindAllSubmatch(body, -1)
-			
-			for _, match := range matches {
-				if len(match) > 1 {
-					nestedURL := string(match[1])
-					// Рекурсивно обрабатываем вложенные sitemap
-					dc.processSitemapURL(nestedURL, &allLinks)
-				}
-			}
+		if dc.ramQueue.Len() < dc.config.MaxRAMQueue {
+			dc.ramQueue.Push(item)
 		} else {
-			// Обычный sitemap
-			dc.extractLinksFromSitemap(body, &allLinks)
-		}
-		
-		if len(allLinks) > 100 {
-			break // Достаточно ссылок
+			batch = append(batch, item)
 		}
 	}
 	
-	// Также проверяем robots.txt для поиска sitemap
-	dc.processRobotsTxt(&allLinks)
-	
-	// Приоритизируем и добавляем в очередь
-	if len(allLinks) > 0 {
-		prioritized := dc.prioritizeLinks(allLinks)
-		maxToAdd := 200 // Увеличил лимит
-		if len(prioritized) < maxToAdd {
-			maxToAdd = len(prioritized)
-		}
-		
-		for i := 0; i < maxToAdd; i++ {
-			select {
-			case dc.queue <- prioritized[i]:
-			default:
-			}
+	// Пролив избытка на диск
+	if len(batch) > 0 {
+		if err := dc.diskQueue.Push(batch); err != nil {
+			dc.logger.Warn("failed to push batch to disk", map[string]interface{}{
+				"domain": dc.domain,
+				"count":  len(batch),
+				"error":  err.Error(),
+			})
 		}
 	}
 }
 
-func (dc *DomainCrawler) processSitemapURL(sitemapURL string, allLinks *[]string) {
-	req, err := http.NewRequestWithContext(dc.ctx, "GET", sitemapURL, nil)
-	if err != nil {
-		return
+func (dc *DomainCrawler) shouldStop() bool {
+	if atomic.LoadInt32(&dc.stopping) == 1 {
+		return true
 	}
 	
-	ua := dc.config.UserAgents[rand.Intn(len(dc.config.UserAgents))]
-	req.Header.Set("User-Agent", ua)
+	found := atomic.LoadInt64(&dc.found)
+	pages := atomic.LoadInt64(&dc.pages)
 	
-	resp, err := dc.client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		return
+	// Достигнут минимум находок
+	if found >= int64(dc.config.MinFindingsPerDomain) {
+		atomic.StoreInt32(&dc.stopping, 1)
+		return true
 	}
 	
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
-	if err != nil {
-		return
+	// Достигнут лимит страниц
+	if pages >= int64(dc.config.MaxPagesPerDomain) {
+		atomic.StoreInt32(&dc.stopping, 1)
+		return true
 	}
 	
-	dc.extractLinksFromSitemap(body, allLinks)
-}
-
-func (dc *DomainCrawler) extractLinksFromSitemap(body []byte, allLinks *[]string) {
-	// Извлекаем URL с приоритетами и датами
-	re := regexp.MustCompile(`<url>.*?<loc>([^<]+)</loc>.*?(?:<lastmod>([^<]+)</lastmod>)?.*?(?:<priority>([^<]+)</priority>)?.*?</url>`)
-	matches := re.FindAllSubmatch(body, -1)
-	
-	type urlInfo struct {
-		url      string
-		lastmod  string
-		priority float64
-	}
-	
-	urls := make([]urlInfo, 0, len(matches))
-	
-	for _, match := range matches {
-		if len(match) > 1 {
-			info := urlInfo{
-				url:      string(match[1]),
-				lastmod:  "",
-				priority: 0.5,
-			}
-			
-			if len(match) > 2 && match[2] != nil {
-				info.lastmod = string(match[2])
-			}
-			
-			if len(match) > 3 && match[3] != nil {
-				if p, err := strconv.ParseFloat(string(match[3]), 64); err == nil {
-					info.priority = p
-				}
-			}
-			
-			urls = append(urls, info)
-		}
-	}
-	
-	// Сортируем по приоритету и дате
-	sort.Slice(urls, func(i, j int) bool {
-		// Сначала по приоритету
-		if urls[i].priority != urls[j].priority {
-			return urls[i].priority > urls[j].priority
-		}
-		// Потом по дате (новые первыми)
-		return urls[i].lastmod > urls[j].lastmod
-	})
-	
-	// Добавляем в список
-	for _, info := range urls {
-		*allLinks = append(*allLinks, info.url)
-	}
-}
-
-func (dc *DomainCrawler) processRobotsTxt(allLinks *[]string) {
-	robotsURL := "https://" + dc.domain + "/robots.txt"
-	
-	req, err := http.NewRequestWithContext(dc.ctx, "GET", robotsURL, nil)
-	if err != nil {
-		return
-	}
-	
-	ua := dc.config.UserAgents[rand.Intn(len(dc.config.UserAgents))]
-	req.Header.Set("User-Agent", ua)
-	
-	resp, err := dc.client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		return
-	}
-	
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 100*1024))
-	if err != nil {
-		return
-	}
-	
-	// Ищем sitemap в robots.txt
-	lines := strings.Split(string(body), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(strings.ToLower(line), "sitemap:") {
-			sitemapURL := strings.TrimSpace(line[8:])
-			dc.processSitemapURL(sitemapURL, allLinks)
-		}
-	}
-	
-	// Также анализируем разрешённые пути
-	userAgentBlock := false
-	for _, line := range lines {
-		line = strings.TrimSpace(strings.ToLower(line))
-		
-		if strings.HasPrefix(line, "user-agent:") {
-			ua := strings.TrimSpace(line[11:])
-			userAgentBlock = (ua == "*" || strings.Contains(ua, "bot"))
-		}
-		
-		if userAgentBlock && strings.HasPrefix(line, "allow:") {
-			path := strings.TrimSpace(line[6:])
-			if path != "/" && path != "" {
-				// Добавляем разрешённые пути для исследования
-				fullURL := "https://" + dc.domain + path
-				*allLinks = append(*allLinks, fullURL)
-			}
-		}
-	}
+	return false
 }
 
 func (dc *DomainCrawler) monitor() {
@@ -2204,514 +2261,436 @@ func (dc *DomainCrawler) monitor() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	
-	emptyQueueCount := 0
+	inactivityCount := 0
+	const maxInactivity = 6 // 30 секунд
 	
 	for {
 		select {
 		case <-dc.ctx.Done():
 			return
-			
 		case <-ticker.C:
 			pages := atomic.LoadInt64(&dc.pages)
 			found := atomic.LoadInt64(&dc.found)
-			queueLen := len(dc.queue)
+			errors := atomic.LoadInt64(&dc.errors)
+			ramQLen := dc.ramQueue.Len()
+			visitedSize := dc.visited.Size()
 			
-			if queueLen == 0 {
-				emptyQueueCount++
-				
-				if emptyQueueCount >= 3 {
-					if pages >= 50 || found > 0 {
-						log.Printf("[%s] Completed: %d pages, %d with comments", dc.domain, pages, found)
-						dc.cancel()
-						return
-					} else if pages > 0 {
-						log.Printf("[%s] Insufficient pages (%d), stopping", dc.domain, pages)
-						dc.cancel()
-						return
-					}
+			lastActivity := dc.getLastActivity()
+			timeSinceActivity := time.Since(lastActivity)
+			
+			dc.logger.Info("domain progress", map[string]interface{}{
+				"domain":         dc.domain,
+				"pages":          pages,
+				"found":          found,
+				"errors":         errors,
+				"ram_queue":      ramQLen,
+				"visited":        visitedSize,
+				"last_activity":  timeSinceActivity.Seconds(),
+			})
+			
+			// Проверка инактивности
+			if ramQLen == 0 && timeSinceActivity > 5*time.Second {
+				inactivityCount++
+				if inactivityCount >= maxInactivity {
+					dc.logger.Info("domain inactive, stopping", map[string]interface{}{
+						"domain": dc.domain,
+					})
+					dc.cancel()
+					return
 				}
 			} else {
-				emptyQueueCount = 0
-			}
-			
-			if pages >= int64(dc.config.MaxPagesPerDomain) {
-				log.Printf("[%s] Reached max pages limit (%d)", dc.domain, pages)
-				dc.cancel()
-				return
+				inactivityCount = 0
 			}
 		}
 	}
 }
 
-func (dc *DomainCrawler) Wait() {
+func (dc *DomainCrawler) checkpointLoop() {
+	defer dc.wg.Done()
+	
+	ticker := time.NewTicker(dc.config.CheckpointInterval)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-dc.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := dc.saveState(); err != nil {
+				dc.logger.Warn("checkpoint failed", map[string]interface{}{
+					"domain": dc.domain,
+					"error":  err.Error(),
+				})
+			} else {
+				dc.logger.Trace("checkpoint saved", map[string]interface{}{
+					"domain": dc.domain,
+				})
+			}
+		}
+	}
+}
+
+func (dc *DomainCrawler) updateActivity() {
+	dc.activityMu.Lock()
+	dc.lastActivity = time.Now()
+	dc.activityMu.Unlock()
+}
+
+func (dc *DomainCrawler) getLastActivity() time.Time {
+	dc.activityMu.Lock()
+	defer dc.activityMu.Unlock()
+	return dc.lastActivity
+}
+
+func (dc *DomainCrawler) Close() error {
+	dc.cancel()
 	dc.wg.Wait()
-}
-
-func (dc *DomainCrawler) Stats() (pages, found, errors int64) {
-	return atomic.LoadInt64(&dc.pages),
-	       atomic.LoadInt64(&dc.found),
-	       atomic.LoadInt64(&dc.errors)
+	
+	if err := dc.diskQueue.Close(); err != nil {
+		dc.logger.Warn("failed to close disk queue", map[string]interface{}{
+			"domain": dc.domain,
+			"error":  err.Error(),
+		})
+	}
+	
+	return nil
 }
 
 // ============================================================================
-// MAIN CRAWLER
+// MAIN CRAWLER (управление доменами)
 // ============================================================================
 
-func NewMainCrawler(config *Config) (*MainCrawler, error) {
+type MainCrawler struct {
+	config         *Config
+	domains        []string
+	httpClient     *HTTPClient
+	resultWriter   *ResultWriter
+	checkpoint     *CheckpointManager
+	logger         *Logger
+	
+	semaphore      chan struct{}
+	wg             sync.WaitGroup
+	ctx            context.Context
+	cancel         context.CancelFunc
+	
+	shuttingDown   int32
+	completedDomains map[string]bool
+	completedMu    sync.Mutex
+}
+
+func NewMainCrawler(config *Config, domains []string, logger *Logger) (*MainCrawler, error) {
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	
+	httpClient := NewHTTPClient(config, logger)
+	
+	resultWriter, err := NewResultWriter(
+		config.OutputDir,
+		config.JSONLSyncInterval,
+		config.TierSyncInterval,
+		logger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create result writer: %w", err)
+	}
+	
+	checkpoint, err := NewCheckpointManager(config.CheckpointDir, logger)
+	if err != nil {
+		return nil, fmt.Errorf("create checkpoint manager: %w", err)
+	}
+	
 	ctx, cancel := context.WithCancel(context.Background())
 	
-	outputFile, err := os.OpenFile(config.OutputFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		cancel()
-		return nil, err
+	maxDomains := config.MaxConcurrentDomains()
+	
+	mc := &MainCrawler{
+		config:           config,
+		domains:          domains,
+		httpClient:       httpClient,
+		resultWriter:     resultWriter,
+		checkpoint:       checkpoint,
+		logger:           logger,
+		semaphore:        make(chan struct{}, maxDomains),
+		ctx:              ctx,
+		cancel:           cancel,
+		completedDomains: make(map[string]bool),
 	}
 	
-	tier1File, _ := os.Create("tier1_definite_comments.txt")
-	tier2File, _ := os.Create("tier2_probable_comments.txt")
-	tier3File, _ := os.Create("tier3_possible_comments.txt")
-	tier4File, _ := os.Create("tier4_ambiguous.txt")
-	
-	crawler := &MainCrawler{
-		config:     config,
-		results:    make(chan *Finding, 1000),
-		outputFile: outputFile,
-		tier1File:  tier1File,
-		tier2File:  tier2File,
-		tier3File:  tier3File,
-		tier4File:  tier4File,
-		ctx:        ctx,
-		cancel:     cancel,
-		startTime:  time.Now(),
-	}
-	
-	crawler.loadCheckpoint()
-	
-	return crawler, nil
+	return mc, nil
 }
 
-func (mc *MainCrawler) loadCheckpoint() {
-	data, err := os.ReadFile(mc.config.CheckpointFile)
-	if err != nil {
-		mc.checkpoint = &Checkpoint{
-			ProcessedDomains: make(map[string]bool),
-			Statistics:       make(map[string]int64),
+func (mc *MainCrawler) Run(ctx context.Context) error {
+	mc.logger.Info("starting main crawler", map[string]interface{}{
+		"domains":          len(mc.domains),
+		"max_concurrent":   cap(mc.semaphore),
+		"workers_per_domain": mc.config.WorkersPerDomain,
+	})
+	
+	for _, domain := range mc.domains {
+		if atomic.LoadInt32(&mc.shuttingDown) == 1 {
+			mc.logger.Info("shutdown in progress, skipping remaining domains", nil)
+			break
 		}
-		return
-	}
-	
-	var cp Checkpoint
-	if err := json.Unmarshal(data, &cp); err != nil {
-		mc.checkpoint = &Checkpoint{
-			ProcessedDomains: make(map[string]bool),
-			Statistics:       make(map[string]int64),
-		}
-		return
-	}
-	
-	mc.checkpoint = &cp
-}
-
-func (mc *MainCrawler) saveCheckpoint() {
-	mc.checkpointMu.Lock()
-	defer mc.checkpointMu.Unlock()
-	
-	mc.checkpoint.Timestamp = time.Now()
-	mc.checkpoint.Statistics["domains_done"] = atomic.LoadInt64(&mc.domainsDone)
-	mc.checkpoint.Statistics["domains_with_comments"] = atomic.LoadInt64(&mc.domainsWithComments)
-	mc.checkpoint.Statistics["pages_total"] = atomic.LoadInt64(&mc.pagesTotal)
-	mc.checkpoint.Statistics["pages_with_comments"] = atomic.LoadInt64(&mc.findingsTotal)
-	
-	data, _ := json.MarshalIndent(mc.checkpoint, "", "  ")
-	os.WriteFile(mc.config.CheckpointFile, data, 0644)
-}
-
-func (mc *MainCrawler) Run(domainFile string) error {
-	domains, err := mc.loadDomains(domainFile)
-	if err != nil {
-		return err
-	}
-	
-	mc.domains = domains
-	atomic.StoreInt64(&mc.domainsTotal, int64(len(domains)))
-	
-	log.Printf("Starting: %d domains | Workers: %d per domain | Timeout: %s", 
-		len(domains), mc.config.WorkersPerDomain, mc.config.RequestTimeout)
-	
-	mc.wg.Add(1)
-	go mc.processResults()
-	
-	mc.wg.Add(1)
-	go mc.checkpointRoutine()
-	
-	mc.wg.Add(1)
-	go mc.progressReporter()
-	
-	semaphore := make(chan struct{}, mc.config.MaxTotalWorkers/mc.config.WorkersPerDomain)
-	
-	for _, domain := range domains {
-		mc.checkpointMu.RLock()
-		processed := mc.checkpoint.ProcessedDomains[domain]
-		mc.checkpointMu.RUnlock()
 		
-		if processed {
-			atomic.AddInt64(&mc.domainsDone, 1)
+		// Проверка, не завершён ли уже домен
+		if mc.isCompleted(domain) {
+			mc.logger.Info("domain already completed, skipping", map[string]interface{}{
+				"domain": domain,
+			})
 			continue
 		}
 		
-		semaphore <- struct{}{}
-		mc.wg.Add(1)
+		// Захват семафора
+		select {
+		case mc.semaphore <- struct{}{}:
+		case <-mc.ctx.Done():
+			mc.logger.Info("context canceled while waiting for semaphore", nil)
+			break
+		}
 		
-		go func(d string) {
-			defer mc.wg.Done()
-			defer func() { <-semaphore }()
-			
-			mc.processDomain(d)
-		}(domain)
+		mc.wg.Add(1)
+		go mc.processDomain(domain)
 	}
 	
+	// Ожидание завершения всех доменов
 	mc.wg.Wait()
 	
-	mc.saveCheckpoint()
-	mc.printFinalStats()
+	// Финальная синхронизация
+	if err := mc.resultWriter.Sync(); err != nil {
+		mc.logger.Warn("final sync failed", map[string]interface{}{"error": err.Error()})
+	}
+	
+	mc.logger.Info("main crawler finished", map[string]interface{}{
+		"completed_domains": len(mc.completedDomains),
+	})
 	
 	return nil
 }
 
 func (mc *MainCrawler) processDomain(domain string) {
-	atomic.AddInt64(&mc.domainsActive, 1)
-	defer atomic.AddInt64(&mc.domainsActive, -1)
-	defer atomic.AddInt64(&mc.domainsDone, 1)
-	
-	dc := NewDomainCrawler(domain, mc.config, mc.results)
-	mc.domainCrawlers.Store(domain, dc)
-	defer mc.domainCrawlers.Delete(domain)
-	
-	dc.Start()
-	dc.Wait()
-	
-	pages, found, errors := dc.Stats()
-	atomic.AddInt64(&mc.pagesTotal, pages)
-	atomic.AddInt64(&mc.errorsTotal, errors)
-	
-	if found > 0 {
-		atomic.AddInt64(&mc.findingsTotal, found)
-		atomic.AddInt64(&mc.domainsWithComments, 1)
-		log.Printf("[%s] Completed: %d pages, %d pages with comments", domain, pages, found)
-	}
-	
-	mc.checkpointMu.Lock()
-	mc.checkpoint.ProcessedDomains[domain] = true
-	mc.checkpointMu.Unlock()
-}
-
-func (mc *MainCrawler) processResults() {
 	defer mc.wg.Done()
-	defer mc.tier1File.Close()
-	defer mc.tier2File.Close()
-	defer mc.tier3File.Close()
-	defer mc.tier4File.Close()
-	
-	encoder := json.NewEncoder(mc.outputFile)
-	uniqueURLs := make(map[string]bool)
-	
-	txtFile, err := os.Create("urls_with_comments.txt")
-	if err == nil {
-		defer txtFile.Close()
-	}
-	
-	for {
-		select {
-		case finding := <-mc.results:
-			if finding == nil {
-				continue
-			}
-			
-			if uniqueURLs[finding.URL] {
-				continue
-			}
-			uniqueURLs[finding.URL] = true
-			
-			// Tier уже установлен в processURL
-			tier := finding.Tier
-			if tier < 1 || tier > 4 {
-				tier = 4
-			}
-			
-			atomic.AddInt64(&mc.tierCounts[tier], 1)
-			
-			line := finding.URL + "\n"
-			
-			switch tier {
-			case 1:
-				mc.tier1File.WriteString(line)
-			case 2:
-				mc.tier2File.WriteString(line)
-			case 3:
-				mc.tier3File.WriteString(line)
-			case 4:
-				mc.tier4File.WriteString(line)
-			}
-			
-			if txtFile != nil && tier <= 3 {
-				txtFile.WriteString(line)
-			}
-			
-			mc.outputMu.Lock()
-			encoder.Encode(finding)
-			mc.outputMu.Unlock()
-			
-		case <-mc.ctx.Done():
-			for len(mc.results) > 0 {
-				finding := <-mc.results
-				if finding != nil && !uniqueURLs[finding.URL] {
-					uniqueURLs[finding.URL] = true
-					tier := finding.Tier
-					
-					if tier < 1 || tier > 4 {
-						tier = 4
-					}
-					
-					atomic.AddInt64(&mc.tierCounts[tier], 1)
-					
-					line := finding.URL + "\n"
-					switch tier {
-					case 1:
-						mc.tier1File.WriteString(line)
-					case 2:
-						mc.tier2File.WriteString(line)
-					case 3:
-						mc.tier3File.WriteString(line)
-					case 4:
-						mc.tier4File.WriteString(line)
-					}
-					
-					if txtFile != nil && tier <= 3 {
-						txtFile.WriteString(line)
-					}
-					
-					encoder.Encode(finding)
-				}
-			}
-			
-			log.Println("\n" + strings.Repeat("=", 60))
-			log.Println("TIER DISTRIBUTION:")
-			log.Printf("  Tier 1 (definite):  %d URLs", atomic.LoadInt64(&mc.tierCounts[1]))
-			log.Printf("  Tier 2 (probable):  %d URLs", atomic.LoadInt64(&mc.tierCounts[2]))
-			log.Printf("  Tier 3 (possible):  %d URLs", atomic.LoadInt64(&mc.tierCounts[3]))
-			log.Printf("  Tier 4 (ambiguous): %d URLs", atomic.LoadInt64(&mc.tierCounts[4]))
-			total := atomic.LoadInt64(&mc.tierCounts[1]) + atomic.LoadInt64(&mc.tierCounts[2]) +
-			        atomic.LoadInt64(&mc.tierCounts[3]) + atomic.LoadInt64(&mc.tierCounts[4])
-			log.Printf("  Total classified:   %d URLs", total)
-			log.Println(strings.Repeat("=", 60))
-			
-			return
+	defer func() { <-mc.semaphore }()
+	defer func() {
+		if r := recover(); r != nil {
+			mc.logger.Error("domain processing panic recovered", map[string]interface{}{
+				"domain": domain,
+				"panic":  r,
+			})
 		}
-	}
-}
-
-func (mc *MainCrawler) checkpointRoutine() {
-	defer mc.wg.Done()
+	}()
 	
-	ticker := time.NewTicker(mc.config.CheckpointInterval)
-	defer ticker.Stop()
+	mc.logger.Info("processing domain", map[string]interface{}{"domain": domain})
 	
-	for {
-		select {
-		case <-ticker.C:
-			mc.saveCheckpoint()
-		case <-mc.ctx.Done():
-			return
-		}
-	}
-}
-
-func (mc *MainCrawler) progressReporter() {
-	defer mc.wg.Done()
-	
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-ticker.C:
-			mc.printStats()
-		case <-mc.ctx.Done():
-			return
-		}
-	}
-}
-
-func (mc *MainCrawler) printStats() {
-	elapsed := time.Since(mc.startTime)
-	domainsTotal := atomic.LoadInt64(&mc.domainsTotal)
-	domainsDone := atomic.LoadInt64(&mc.domainsDone)
-	domainsActive := atomic.LoadInt64(&mc.domainsActive)
-	pagesTotal := atomic.LoadInt64(&mc.pagesTotal)
-	findingsTotal := atomic.LoadInt64(&mc.findingsTotal)
-	errorsTotal := atomic.LoadInt64(&mc.errorsTotal)
-	
-	pagesPerSec := float64(pagesTotal) / elapsed.Seconds()
-	domainsProgress := float64(domainsDone) * 100 / float64(domainsTotal)
-	
-	tier1 := atomic.LoadInt64(&mc.tierCounts[1])
-	tier2 := atomic.LoadInt64(&mc.tierCounts[2])
-	tierStr := ""
-	if tier1 > 0 || tier2 > 0 {
-		tierStr = fmt.Sprintf(" | T1:%d T2:%d", tier1, tier2)
-	}
-	
-	log.Printf("[%.1f%%] Active: %d | Done: %d/%d | Pages: %d (%.1f/s) | Pages with comments: %d%s | Errors: %d",
-		domainsProgress,
-		domainsActive,
-		domainsDone, domainsTotal,
-		pagesTotal, pagesPerSec,
-		findingsTotal,
-		tierStr,
-		errorsTotal,
+	crawler, err := NewDomainCrawler(
+		domain,
+		mc.config,
+		mc.httpClient,
+		mc.resultWriter,
+		mc.checkpoint,
+		mc.logger,
 	)
-}
-
-func (mc *MainCrawler) printFinalStats() {
-	elapsed := time.Since(mc.startTime)
-	domainsTotal := atomic.LoadInt64(&mc.domainsTotal)
-	domainsDone := atomic.LoadInt64(&mc.domainsDone)
-	pagesTotal := atomic.LoadInt64(&mc.pagesTotal)
-	domainsWithComments := atomic.LoadInt64(&mc.domainsWithComments)
-	pagesWithComments := atomic.LoadInt64(&mc.findingsTotal)
-	errorsTotal := atomic.LoadInt64(&mc.errorsTotal)
-	
-	successRate := float64(domainsWithComments) * 100 / maxFloat(1, float64(domainsDone))
-	
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Printf("FINAL RESULTS\n")
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("Runtime: %s\n", elapsed.Truncate(time.Second))
-	fmt.Printf("Domains processed: %d/%d\n", domainsDone, domainsTotal)
-	fmt.Printf("Total pages crawled: %d\n", pagesTotal)
-	fmt.Printf("Domains with comments: %d (%.1f%%)\n", domainsWithComments, successRate)
-	fmt.Printf("Pages with comments: %d\n", pagesWithComments)
-	fmt.Printf("Total errors: %d\n", errorsTotal)
-	fmt.Printf("Output files:\n")
-	fmt.Printf("  - %s (JSON with all data)\n", mc.config.OutputFile)
-	fmt.Printf("  - tier1_definite_comments.txt\n")
-	fmt.Printf("  - tier2_probable_comments.txt\n")
-	fmt.Printf("  - tier3_possible_comments.txt\n")
-	fmt.Printf("  - tier4_ambiguous.txt\n")
-	fmt.Println(strings.Repeat("=", 60))
-}
-
-func (mc *MainCrawler) loadDomains(path string) ([]string, error) {
-	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		mc.logger.Error("failed to create domain crawler", map[string]interface{}{
+			"domain": domain,
+			"error":  err.Error(),
+		})
+		return
 	}
-	defer file.Close()
+	defer crawler.Close()
 	
-	var domains []string
-	scanner := bufio.NewScanner(file)
-	
-	for scanner.Scan() {
-		domain := strings.TrimSpace(scanner.Text())
-		if domain == "" || strings.HasPrefix(domain, "#") {
-			continue
-		}
-		
-		domain = strings.TrimPrefix(domain, "http://")
-		domain = strings.TrimPrefix(domain, "https://")
-		domain = strings.TrimPrefix(domain, "www.")
-		domain = strings.TrimSuffix(domain, "/")
-		
-		domains = append(domains, strings.ToLower(domain))
+	if err := crawler.Start(mc.ctx); err != nil {
+		mc.logger.Error("domain crawler failed", map[string]interface{}{
+			"domain": domain,
+			"error":  err.Error(),
+		})
+		return
 	}
 	
-	return domains, scanner.Err()
+	mc.markCompleted(domain)
+	mc.logger.Info("domain completed", map[string]interface{}{"domain": domain})
 }
 
-func (mc *MainCrawler) Shutdown() {
-	log.Println("Shutting down...")
+func (mc *MainCrawler) isCompleted(domain string) bool {
+	mc.completedMu.Lock()
+	defer mc.completedMu.Unlock()
+	return mc.completedDomains[domain]
+}
+
+func (mc *MainCrawler) markCompleted(domain string) {
+	mc.completedMu.Lock()
+	defer mc.completedMu.Unlock()
+	mc.completedDomains[domain] = true
+}
+
+func (mc *MainCrawler) Shutdown(ctx context.Context) error {
+	mc.logger.Info("initiating graceful shutdown", nil)
+	
+	atomic.StoreInt32(&mc.shuttingDown, 1)
 	mc.cancel()
 	
-	mc.domainCrawlers.Range(func(key, value interface{}) bool {
-		if dc, ok := value.(*DomainCrawler); ok {
-			dc.cancel()
-		}
-		return true
-	})
+	// Ожидание завершения с таймаутом
+	done := make(chan struct{})
+	go func() {
+		mc.wg.Wait()
+		close(done)
+	}()
 	
-	mc.wg.Wait()
-	mc.outputFile.Close()
-	mc.saveCheckpoint()
-	mc.printFinalStats()
+	select {
+	case <-done:
+		mc.logger.Info("graceful shutdown completed", nil)
+	case <-ctx.Done():
+		mc.logger.Warn("graceful shutdown timeout", nil)
+		return fmt.Errorf("graceful shutdown timeout")
+	}
+	
+	// Закрытие writer
+	if err := mc.resultWriter.Sync(); err != nil {
+		mc.logger.Warn("failed to sync result writer", map[string]interface{}{"error": err.Error()})
+	}
+	if err := mc.resultWriter.Close(); err != nil {
+		mc.logger.Warn("failed to close result writer", map[string]interface{}{"error": err.Error()})
+	}
+	
+	return nil
 }
 
 // ============================================================================
-// UTILITIES
+// CLI & MAIN
 // ============================================================================
 
-func cleanQuery(values url.Values) string {
-	tracking := []string{
-		"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-		"gclid", "fbclid", "yclid", "_ga",
-	}
-	
-	for _, param := range tracking {
-		values.Del(param)
-	}
-	
-	return values.Encode()
+type CLIFlags struct {
+	DomainsFile      string
+	WorkersPerDomain int
+	MaxWorkers       int
+	MaxPages         int
+	MinFindings      int
+	OutputDir        string
+	CheckpointDir    string
+	QueueDir         string
+	Timeout          time.Duration
+	LogLevel         string
+	LogJSON          bool
+	WindowsMode      bool
 }
 
-func maxFloat(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// ============================================================================
-// MAIN
-// ============================================================================
-
-func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
+func parseFlags() (*CLIFlags, error) {
+	flags := &CLIFlags{}
 	
-	var (
-		domainFile = flag.String("domains", "", "Domain list file (required)")
-		workers    = flag.Int("workers", 3, "Workers per domain")
-		maxWorkers = flag.Int("max-workers", 300, "Maximum total workers")
-		maxPages   = flag.Int("max-pages", 1000, "Max pages per domain")
-		output     = flag.String("output", "comments_found.jsonl", "Output file")
-		checkpoint = flag.String("checkpoint", "checkpoint.json", "Checkpoint file")
-	)
+	flag.StringVar(&flags.DomainsFile, "domains", "", "path to domains file (one per line)")
+	flag.IntVar(&flags.WorkersPerDomain, "workers", 5, "workers per domain")
+	flag.IntVar(&flags.MaxWorkers, "max-workers", 100, "max total workers")
+	flag.IntVar(&flags.MaxPages, "max-pages", 5000, "max pages per domain")
+	flag.IntVar(&flags.MinFindings, "min-findings", 50, "minimum findings per domain")
+	flag.StringVar(&flags.OutputDir, "output", "./data/output", "output directory")
+	flag.StringVar(&flags.CheckpointDir, "checkpoint", "./data/checkpoint", "checkpoint directory")
+	flag.StringVar(&flags.QueueDir, "queue", "./data/queue", "queue directory")
+	flag.DurationVar(&flags.Timeout, "timeout", 0, "domain timeout (0=no limit)")
+	flag.StringVar(&flags.LogLevel, "log-level", "INFO", "log level (TRACE/INFO/WARN/ERROR)")
+	flag.BoolVar(&flags.LogJSON, "log-json", false, "output logs as JSON")
+	flag.BoolVar(&flags.WindowsMode, "windows-mode", runtime.GOOS == "windows", "Windows compatibility mode")
 	
 	flag.Parse()
 	
-	if *domainFile == "" {
-		log.Fatal("Domain file is required (-domains flag)")
+	if flags.DomainsFile == "" {
+		return nil, fmt.Errorf("domains file is required")
 	}
+	
+	return flags, nil
+}
+
+func loadDomains(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open domains file: %w", err)
+	}
+	defer f.Close()
+	
+	var domains []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		domain := strings.TrimSpace(scanner.Text())
+		if domain != "" && !strings.HasPrefix(domain, "#") {
+			domains = append(domains, domain)
+		}
+	}
+	
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan domains: %w", err)
+	}
+	
+	return domains, nil
+}
+
+func main() {
+	flags, err := parseFlags()
+	if err != nil {
+		log.Fatalf("Invalid flags: %v", err)
+	}
+	
+	logger := NewLogger(flags.LogLevel, flags.LogJSON)
+	
+	domains, err := loadDomains(flags.DomainsFile)
+	if err != nil {
+		logger.Error("failed to load domains", map[string]interface{}{"error": err.Error()})
+		os.Exit(1)
+	}
+	
+	logger.Info("loaded domains", map[string]interface{}{"count": len(domains)})
 	
 	config := DefaultConfig()
-	config.WorkersPerDomain = *workers
-	config.MaxTotalWorkers = *maxWorkers
-	config.MaxPagesPerDomain = *maxPages
-	config.OutputFile = *output
-	config.CheckpointFile = *checkpoint
+	config.WorkersPerDomain = flags.WorkersPerDomain
+	config.MaxTotalWorkers = flags.MaxWorkers
+	config.MaxPagesPerDomain = flags.MaxPages
+	config.MinFindingsPerDomain = flags.MinFindings
+	config.OutputDir = flags.OutputDir
+	config.CheckpointDir = flags.CheckpointDir
+	config.DiskQueueDir = flags.QueueDir
+	config.DomainDeadline = flags.Timeout
+	config.LogLevel = flags.LogLevel
+	config.LogJSON = flags.LogJSON
+	config.WindowsMode = flags.WindowsMode
 	
-	crawler, err := NewMainCrawler(config)
+	crawler, err := NewMainCrawler(config, domains, logger)
 	if err != nil {
-		log.Fatalf("Failed to create crawler: %v", err)
+		logger.Error("failed to create crawler", map[string]interface{}{"error": err.Error()})
+		os.Exit(1)
 	}
 	
+	// Обработка сигналов
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	if config.WindowsMode {
+		// Windows: только os.Interrupt (Ctrl+C)
+		signal.Notify(sigChan, os.Interrupt)
+	} else {
+		// Unix-like: SIGINT и SIGTERM
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	}
 	
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
+	// Горутина для обработки сигналов
 	go func() {
-		<-sigChan
-		crawler.Shutdown()
-		os.Exit(0)
+		sig := <-sigChan
+		logger.Info("received signal", map[string]interface{}{"signal": sig.String()})
+		
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+		
+		if err := crawler.Shutdown(shutdownCtx); err != nil {
+			logger.Error("shutdown error", map[string]interface{}{"error": err.Error()})
+			os.Exit(1)
+		}
+		
+		cancel()
 	}()
 	
-	if err := crawler.Run(*domainFile); err != nil {
-		log.Fatalf("Crawler failed: %v", err)
+	// Запуск краулера
+	if err := crawler.Run(ctx); err != nil {
+		logger.Error("crawler error", map[string]interface{}{"error": err.Error()})
+		os.Exit(1)
 	}
+	
+	logger.Info("crawler completed successfully", nil)
 }
