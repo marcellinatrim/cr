@@ -27,11 +27,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"golang.org/x/net/html"
-	"golang.org/x/net/html/charset"
-	"golang.org/x/text/encoding"
-	"golang.org/x/text/encoding/htmlindex"
 )
 
 // ============================================================================
@@ -973,7 +968,7 @@ func isSameDomain(urlStr string, domain string) bool {
 }
 
 func extractLinks(htmlContent []byte, baseURL *url.URL, domain string) ([]string, error) {
-	doc, err := html.Parse(bytes.NewReader(htmlContent))
+	doc, err := parseHTML(bytes.NewReader(htmlContent))
 	if err != nil {
 		return nil, fmt.Errorf("parse html: %w", err)
 	}
@@ -981,11 +976,11 @@ func extractLinks(htmlContent []byte, baseURL *url.URL, domain string) ([]string
 	seen := make(map[string]bool)
 	var links []string
 
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "a" {
+	var walk func(*HTMLNode)
+	walk = func(n *HTMLNode) {
+		if n.Type == HTMLElementNode && n.Data == "a" {
 			for _, attr := range n.Attr {
-				if attr.Key == "href" {
+				if strings.ToLower(attr.Key) == "href" {
 					normalized, err := normalizeURL(attr.Val, baseURL)
 					if err != nil {
 						continue
@@ -1032,11 +1027,11 @@ func detectCharset(contentType string, body []byte) string {
 	}
 
 	// Из meta тегов
-	doc, err := html.Parse(bytes.NewReader(body))
+	doc, err := parseHTML(bytes.NewReader(body))
 	if err == nil {
-		var findCharset func(*html.Node) string
-		findCharset = func(n *html.Node) string {
-			if n.Type == html.ElementNode && n.Data == "meta" {
+		var findCharset func(*HTMLNode) string
+		findCharset = func(n *HTMLNode) string {
+			if n.Type == HTMLElementNode && n.Data == "meta" {
 				var httpEquiv, content, charsetAttr string
 				for _, attr := range n.Attr {
 					switch strings.ToLower(attr.Key) {
@@ -1083,26 +1078,145 @@ func detectCharset(contentType string, body []byte) string {
 func convertToUTF8(body []byte, charsetName string) ([]byte, error) {
 	charsetName = strings.ToLower(strings.TrimSpace(charsetName))
 
-	if charsetName == "" || charsetName == "utf-8" || charsetName == "utf8" {
+	switch charsetName {
+	case "", "utf-8", "utf8":
+		return body, nil
+	case "iso-8859-1", "latin1":
+		return []byte(string(decodeSingleByte(body, latin1Table))), nil
+	case "windows-1252", "cp1252":
+		return []byte(string(decodeSingleByte(body, windows1252Table))), nil
+	case "windows-1251", "cp1251":
+		return []byte(string(decodeSingleByte(body, windows1251Table))), nil
+	case "koi8-r":
+		return []byte(string(decodeSingleByte(body, koi8rTable))), nil
+	default:
 		return body, nil
 	}
-
-	var dec *encoding.Decoder
-
-	enc, err := htmlindex.Get(charsetName)
-	if err != nil {
-		// Fallback: вернуть как есть
-		return body, nil
-	}
-
-	dec = enc.NewDecoder()
-	decoded, err := dec.Bytes(body)
-	if err != nil {
-		return body, nil
-	}
-
-	return decoded, nil
 }
+
+func decodeSingleByte(data []byte, table [256]rune) []rune {
+	if len(data) == 0 {
+		return nil
+	}
+
+	result := make([]rune, len(data))
+	for i, b := range data {
+		r := table[int(b)]
+		if r == 0xfffe || r == 0x0000 {
+			r = '?'
+		}
+		result[i] = r
+	}
+	return result
+}
+
+var latin1Table = func() [256]rune {
+	var table [256]rune
+	for i := 0; i < len(table); i++ {
+		table[i] = rune(i)
+	}
+	return table
+}()
+
+var windows1252Table = func() [256]rune {
+	table := latin1Table
+	overrides := map[int]rune{
+		0x80: 0x20ac,
+		0x81: 0xfffe,
+		0x82: 0x201a,
+		0x83: 0x0192,
+		0x84: 0x201e,
+		0x85: 0x2026,
+		0x86: 0x2020,
+		0x87: 0x2021,
+		0x88: 0x02c6,
+		0x89: 0x2030,
+		0x8a: 0x0160,
+		0x8b: 0x2039,
+		0x8c: 0x0152,
+		0x8d: 0xfffe,
+		0x8e: 0x017d,
+		0x8f: 0xfffe,
+		0x90: 0xfffe,
+		0x91: 0x2018,
+		0x92: 0x2019,
+		0x93: 0x201c,
+		0x94: 0x201d,
+		0x95: 0x2022,
+		0x96: 0x2013,
+		0x97: 0x2014,
+		0x98: 0x02dc,
+		0x99: 0x2122,
+		0x9a: 0x0161,
+		0x9b: 0x203a,
+		0x9c: 0x0153,
+		0x9d: 0xfffe,
+		0x9e: 0x017e,
+		0x9f: 0x0178,
+	}
+	for idx, r := range overrides {
+		table[idx] = r
+	}
+	return table
+}()
+
+var windows1251Table = func() [256]rune {
+	var table [256]rune
+	for i := 0; i < 128; i++ {
+		table[i] = rune(i)
+	}
+	mapping := [...]rune{
+		0x0402, 0x0403, 0x201a, 0x0453, 0x201e, 0x2026, 0x2020, 0x2021,
+		0x20ac, 0x2030, 0x0409, 0x2039, 0x040a, 0x040c, 0x040b, 0x040f,
+		0x0452, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+		0xfffe, 0x2122, 0x0459, 0x203a, 0x045a, 0x045c, 0x045b, 0x045f,
+		0x00a0, 0x040e, 0x045e, 0x0408, 0x00a4, 0x0490, 0x00a6, 0x00a7,
+		0x0401, 0x00a9, 0x0404, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x0407,
+		0x00b0, 0x00b1, 0x0406, 0x0456, 0x0491, 0x00b5, 0x00b6, 0x00b7,
+		0x0451, 0x2116, 0x0454, 0x00bb, 0x0458, 0x0405, 0x0455, 0x0457,
+		0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417,
+		0x0418, 0x0419, 0x041a, 0x041b, 0x041c, 0x041d, 0x041e, 0x041f,
+		0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427,
+		0x0428, 0x0429, 0x042a, 0x042b, 0x042c, 0x042d, 0x042e, 0x042f,
+		0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437,
+		0x0438, 0x0439, 0x043a, 0x043b, 0x043c, 0x043d, 0x043e, 0x043f,
+		0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447,
+		0x0448, 0x0449, 0x044a, 0x044b, 0x044c, 0x044d, 0x044e, 0x044f,
+	}
+	for i, r := range mapping {
+		table[0x80+i] = r
+	}
+	return table
+}()
+
+var koi8rTable = func() [256]rune {
+	var table [256]rune
+	for i := 0; i < 128; i++ {
+		table[i] = rune(i)
+	}
+	mapping := [...]rune{
+		0x2500, 0x2502, 0x250c, 0x2510, 0x2514, 0x2518, 0x251c, 0x2524,
+		0x252c, 0x2534, 0x253c, 0x2580, 0x2584, 0x2588, 0x258c, 0x2590,
+		0x2591, 0x2592, 0x2593, 0x2320, 0x25a0, 0x2219, 0x221a, 0x2248,
+		0x2264, 0x2265, 0x00a0, 0x2321, 0x00b0, 0x00b2, 0x00b7, 0x00f7,
+		0x2550, 0x2551, 0x2552, 0x0451, 0x2553, 0x2554, 0x2555, 0x2556,
+		0x2557, 0x2558, 0x2559, 0x255a, 0x255b, 0x255c, 0x255d, 0x255e,
+		0x255f, 0x2560, 0x2561, 0x0401, 0x2562, 0x2563, 0x2564, 0x2565,
+		0x2566, 0x2567, 0x2568, 0x2569, 0x256a, 0x256b, 0x256c, 0x00a9,
+		0x044e, 0x0430, 0x0431, 0x0446, 0x0434, 0x0435, 0x0444, 0x0433,
+		0x0445, 0x0438, 0x0439, 0x043a, 0x043b, 0x043c, 0x043d, 0x043e,
+		0x043f, 0x044f, 0x0440, 0x0441, 0x0442, 0x0443, 0x0436, 0x0432,
+		0x044c, 0x044b, 0x0437, 0x0448, 0x044d, 0x0449, 0x0447, 0x044a,
+		0x042e, 0x0410, 0x0411, 0x0426, 0x0414, 0x0415, 0x0424, 0x0413,
+		0x0425, 0x0418, 0x0419, 0x041a, 0x041b, 0x041c, 0x041d, 0x041e,
+		0x041f, 0x042f, 0x0420, 0x0421, 0x0422, 0x0423, 0x0416, 0x0412,
+		0x042c, 0x042b, 0x0417, 0x0428, 0x042d, 0x0429, 0x0427, 0x042a,
+	}
+	for i, r := range mapping {
+		table[0x80+i] = r
+	}
+	return table
+}()
 
 // ============================================================================
 // HTTP CLIENT & FETCHING
@@ -1373,7 +1487,7 @@ var commentSystems = []string{
 }
 
 func detectComments(htmlContent []byte, metadata *PageMetadata) (*Finding, bool) {
-	doc, err := html.Parse(bytes.NewReader(htmlContent))
+	doc, err := parseHTML(bytes.NewReader(htmlContent))
 	if err != nil {
 		return nil, false
 	}
@@ -1464,15 +1578,15 @@ func detectComments(htmlContent []byte, metadata *PageMetadata) (*Finding, bool)
 	return finding, true
 }
 
-func detectCommentForm(n *html.Node) (bool, []Signal) {
+func detectCommentForm(n *HTMLNode) (bool, []Signal) {
 	var signals []Signal
 	hasTextarea := false
 	hasCommentField := false
 	hasSubmit := false
 
-	var walk func(*html.Node)
-	walk = func(node *html.Node) {
-		if node.Type == html.ElementNode {
+	var walk func(*HTMLNode)
+	walk = func(node *HTMLNode) {
+		if node.Type == HTMLElementNode {
 			switch node.Data {
 			case "form":
 				// Проверка action/id формы
@@ -1543,15 +1657,15 @@ func detectCommentForm(n *html.Node) (bool, []Signal) {
 	return len(signals) > 0, signals
 }
 
-func detectCommentStructure(n *html.Node) (bool, []Signal) {
+func detectCommentStructure(n *HTMLNode) (bool, []Signal) {
 	var signals []Signal
 	commentNodes := 0
 	authorNodes := 0
 	dateNodes := 0
 
-	var walk func(*html.Node)
-	walk = func(node *html.Node) {
-		if node.Type == html.ElementNode {
+	var walk func(*HTMLNode)
+	walk = func(node *HTMLNode) {
+		if node.Type == HTMLElementNode {
 			for _, attr := range node.Attr {
 				val := strings.ToLower(attr.Val)
 
@@ -1607,7 +1721,7 @@ func detectCommentStructure(n *html.Node) (bool, []Signal) {
 	return len(signals) > 0, signals
 }
 
-func detectSchemaMarkup(n *html.Node) (bool, []Signal) {
+func detectSchemaMarkup(n *HTMLNode) (bool, []Signal) {
 	var signals []Signal
 	htmlStr := renderNode(n)
 	htmlLower := strings.ToLower(htmlStr)
@@ -1648,13 +1762,13 @@ func detectSchemaMarkup(n *html.Node) (bool, []Signal) {
 	return len(signals) > 0, signals
 }
 
-func extractTitle(n *html.Node) string {
+func extractTitle(n *HTMLNode) string {
 	var title string
 
-	var walk func(*html.Node)
-	walk = func(node *html.Node) {
-		if node.Type == html.ElementNode && node.Data == "title" {
-			if node.FirstChild != nil && node.FirstChild.Type == html.TextNode {
+	var walk func(*HTMLNode)
+	walk = func(node *HTMLNode) {
+		if node.Type == HTMLElementNode && node.Data == "title" {
+			if node.FirstChild != nil && node.FirstChild.Type == HTMLTextNode {
 				title = strings.TrimSpace(node.FirstChild.Data)
 				return
 			}
@@ -1672,10 +1786,8 @@ func extractTitle(n *html.Node) string {
 	return title
 }
 
-func renderNode(n *html.Node) string {
-	var buf bytes.Buffer
-	html.Render(&buf, n)
-	return buf.String()
+func renderNode(n *HTMLNode) string {
+	return renderHTML(n)
 }
 
 // ============================================================================
