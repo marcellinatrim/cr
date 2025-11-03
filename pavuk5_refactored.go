@@ -1399,6 +1399,21 @@ func (dq *DiskQueue) Close() error {
 	return dq.file.Close()
 }
 
+func (dq *DiskQueue) HasPending() bool {
+	dq.mu.Lock()
+	defer dq.mu.Unlock()
+
+	info, err := dq.file.Stat()
+	if err != nil {
+		if dq.logger != nil {
+			dq.logger.Warn("queue stat failed", map[string]interface{}{"error": err.Error()})
+		}
+		return false
+	}
+
+	return info.Size() > dq.offset
+}
+
 // ============================================================================
 // PRIORITY QUEUE (RAM-heap для топовых ссылок)
 // ============================================================================
@@ -1502,6 +1517,19 @@ type ResultWriter struct {
 	dedupCounter  int64
 }
 
+func tierOutputFilename(tier int) string {
+	switch tier {
+	case 1:
+		return "tier1_definite.txt"
+	case 2:
+		return "tier2_probable.txt"
+	case 3:
+		return "tier3_check.txt"
+	default:
+		return "tier4_atypical.txt"
+	}
+}
+
 func NewResultWriter(outputDir string, jsonlSync, tierSync time.Duration, logger *Logger) (*ResultWriter, error) {
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return nil, fmt.Errorf("create output dir: %w", err)
@@ -1515,14 +1543,15 @@ func NewResultWriter(outputDir string, jsonlSync, tierSync time.Duration, logger
 
 	tierFiles := make(map[int]*os.File)
 	for tier := 1; tier <= 4; tier++ {
-		path := filepath.Join(outputDir, fmt.Sprintf("tier%d.txt", tier))
+		fileName := tierOutputFilename(tier)
+		path := filepath.Join(outputDir, fileName)
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			jsonlFile.Close()
 			for _, tf := range tierFiles {
 				tf.Close()
 			}
-			return nil, fmt.Errorf("open tier%d file: %w", tier, err)
+			return nil, fmt.Errorf("open %s: %w", fileName, err)
 		}
 		tierFiles[tier] = f
 	}
@@ -1591,14 +1620,14 @@ func (rw *ResultWriter) WriteFinding(f Finding) error {
 					"tier":  f.Tier,
 					"error": err.Error(),
 				})
-				return fmt.Errorf("write tier%d: %w", f.Tier, err)
+				return fmt.Errorf("write %s: %w", tierOutputFilename(f.Tier), err)
 			}
 			tierFile = rw.tierFiles[f.Tier]
 			if tierFile == nil {
-				return fmt.Errorf("tier%d file missing after reopen", f.Tier)
+				return fmt.Errorf("tier file missing after reopen: %s", tierOutputFilename(f.Tier))
 			}
 			if _, err := tierFile.WriteString(line); err != nil {
-				return fmt.Errorf("write tier%d after reopen: %w", f.Tier, err)
+				return fmt.Errorf("write %s after reopen: %w", tierOutputFilename(f.Tier), err)
 			}
 		}
 	}
@@ -1646,7 +1675,9 @@ func (rw *ResultWriter) reopenJSONL() error {
 
 func (rw *ResultWriter) reopenTier(tier int) error {
 	count := atomic.AddInt32(&rw.reopenCount, 1)
-	newPath := filepath.Join(rw.outputDir, fmt.Sprintf("tier%d_reopened_%d.txt", tier, count))
+	baseName := tierOutputFilename(tier)
+	prefix := strings.TrimSuffix(baseName, ".txt")
+	newPath := filepath.Join(rw.outputDir, fmt.Sprintf("%s_reopened_%d.txt", prefix, count))
 
 	newFile, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -1658,8 +1689,9 @@ func (rw *ResultWriter) reopenTier(tier int) error {
 	oldFile.Close()
 
 	rw.logger.Info("reopened tier file", map[string]interface{}{
-		"tier":     tier,
-		"new_path": newPath,
+		"tier":      tier,
+		"base_name": baseName,
+		"new_path":  newPath,
 	})
 	return nil
 }
@@ -3827,8 +3859,23 @@ func (dc *DomainCrawler) monitor() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	inactivityCount := 0
-	const maxInactivity = 6 // 30 секунд
+	baseInactivity := 30 * time.Second
+	extendedInactivity := 2 * time.Minute
+	if interval := dc.config.CheckpointInterval; interval > 0 {
+		candidate := 4 * interval
+		if candidate > extendedInactivity {
+			extendedInactivity = candidate
+		}
+	}
+	if deadline := dc.config.DomainDeadline; deadline > 0 {
+		candidate := deadline / 4
+		if candidate > extendedInactivity {
+			extendedInactivity = candidate
+		}
+	}
+	if extendedInactivity < baseInactivity {
+		extendedInactivity = baseInactivity
+	}
 
 	for {
 		select {
@@ -3839,33 +3886,40 @@ func (dc *DomainCrawler) monitor() {
 			found := atomic.LoadInt64(&dc.found)
 			errors := atomic.LoadInt64(&dc.errors)
 			ramQLen := dc.ramQueue.Len()
+			diskPending := false
+			if dc.diskQueue != nil {
+				diskPending = dc.diskQueue.HasPending()
+			}
 			visitedSize := dc.visited.Size()
 
 			lastActivity := dc.getLastActivity()
 			timeSinceActivity := time.Since(lastActivity)
 
+			inactivityThreshold := baseInactivity
+			if found < int64(dc.config.MinFindingsPerDomain) {
+				inactivityThreshold = extendedInactivity
+			}
+
 			dc.logger.Info("domain progress", map[string]interface{}{
-				"domain":        dc.domain,
-				"pages":         pages,
-				"found":         found,
-				"errors":        errors,
-				"ram_queue":     ramQLen,
-				"visited":       visitedSize,
-				"last_activity": timeSinceActivity.Seconds(),
+				"domain":         dc.domain,
+				"pages":          pages,
+				"found":          found,
+				"errors":         errors,
+				"ram_queue":      ramQLen,
+				"disk_pending":   diskPending,
+				"visited":        visitedSize,
+				"inactivity_s":   timeSinceActivity.Seconds(),
+				"stop_threshold": inactivityThreshold.Seconds(),
 			})
 
-			// Проверка инактивности
-			if ramQLen == 0 && timeSinceActivity > 5*time.Second {
-				inactivityCount++
-				if inactivityCount >= maxInactivity {
-					dc.logger.Info("domain inactive, stopping", map[string]interface{}{
-						"domain": dc.domain,
-					})
-					dc.cancel()
-					return
-				}
-			} else {
-				inactivityCount = 0
+			if ramQLen == 0 && !diskPending && timeSinceActivity > inactivityThreshold {
+				dc.logger.Info("domain inactive, stopping", map[string]interface{}{
+					"domain":            dc.domain,
+					"threshold_seconds": inactivityThreshold.Seconds(),
+					"found":             found,
+				})
+				dc.cancel()
+				return
 			}
 		}
 	}
