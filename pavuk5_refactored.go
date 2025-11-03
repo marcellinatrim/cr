@@ -12,8 +12,11 @@ import (
 	"flag"
 	"fmt"
 	"hash/crc32"
+	"hash/fnv"
 	"io"
 	"log"
+	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +32,17 @@ import (
 	"syscall"
 	"time"
 )
+
+var (
+	randMu     sync.Mutex
+	globalRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+)
+
+func randomFloat64() float64 {
+	randMu.Lock()
+	defer randMu.Unlock()
+	return globalRand.Float64()
+}
 
 // ============================================================================
 // КОНФИГУРАЦИЯ
@@ -52,6 +67,10 @@ type Config struct {
 	MaxRedirects       int
 	MaxBodySize        int64
 	InsecureSkipVerify bool
+	EnableRetry        bool
+	MaxRetries         int
+	RetryBaseBackoff   time.Duration
+	EnableRedirectLoop bool
 
 	// Директории
 	DiskQueueDir  string
@@ -59,13 +78,16 @@ type Config struct {
 	OutputDir     string
 
 	// Синхронизация
-	TierSyncInterval   time.Duration
-	JSONLSyncInterval  time.Duration
-	CheckpointInterval time.Duration
+	TierSyncInterval    time.Duration
+	JSONLSyncInterval   time.Duration
+	CheckpointInterval  time.Duration
+	GlobalStatsInterval time.Duration
 
 	// Очереди
-	MaxRAMQueue   int
-	DiskBatchSize int
+	MaxRAMQueue              int
+	DiskBatchSize            int
+	EnableVisitedSnapshot    bool
+	VisitedSnapshotThreshold int
 
 	// Логирование
 	LogLevel string
@@ -73,6 +95,24 @@ type Config struct {
 
 	// Платформа
 	WindowsMode bool
+
+	// Приоритезация и классификация
+	EnableTierHysteresis    bool
+	TierHysteresisWindow    float64
+	TierHysteresisTTL       time.Duration
+	TierHysteresisCache     int
+	EnableLastModifiedBonus bool
+	EnableCanonicalDedup    bool
+
+	// Rate limit
+	EnableRateLimit bool
+	RateLimitRPS    float64
+
+	// Robots policy ("log" или "respect")
+	RobotsPolicy string
+
+	// Глобальная статистика
+	GlobalStatsPath string
 }
 
 func DefaultConfig() *Config {
@@ -92,22 +132,41 @@ func DefaultConfig() *Config {
 		MaxRedirects:       10,
 		MaxBodySize:        20 * 1024 * 1024, // 20 MB
 		InsecureSkipVerify: false,
+		EnableRetry:        true,
+		MaxRetries:         3,
+		RetryBaseBackoff:   500 * time.Millisecond,
+		EnableRedirectLoop: true,
 
 		DiskQueueDir:  "./data/queue",
 		CheckpointDir: "./data/checkpoint",
 		OutputDir:     "./data/output",
 
-		TierSyncInterval:   5 * time.Second,
-		JSONLSyncInterval:  5 * time.Second,
-		CheckpointInterval: 10 * time.Second,
+		TierSyncInterval:    5 * time.Second,
+		JSONLSyncInterval:   5 * time.Second,
+		CheckpointInterval:  10 * time.Second,
+		GlobalStatsInterval: 15 * time.Second,
 
-		MaxRAMQueue:   512,
-		DiskBatchSize: 100,
+		MaxRAMQueue:              512,
+		DiskBatchSize:            100,
+		EnableVisitedSnapshot:    true,
+		VisitedSnapshotThreshold: 5_000_000,
 
 		LogLevel: "INFO",
 		LogJSON:  false,
 
 		WindowsMode: runtime.GOOS == "windows",
+
+		EnableTierHysteresis:    true,
+		TierHysteresisWindow:    0.02,
+		TierHysteresisTTL:       10 * time.Minute,
+		TierHysteresisCache:     10000,
+		EnableLastModifiedBonus: true,
+		EnableCanonicalDedup:    true,
+
+		EnableRateLimit: false,
+		RateLimitRPS:    3.0,
+
+		RobotsPolicy: "log",
 	}
 }
 
@@ -130,12 +189,46 @@ func (c *Config) Validate() error {
 	if c.DiskBatchSize < 1 {
 		c.DiskBatchSize = 1
 	}
+	if c.MaxRetries < 1 {
+		c.MaxRetries = 1
+	}
+	if c.RetryBaseBackoff <= 0 {
+		c.RetryBaseBackoff = 500 * time.Millisecond
+	}
+	if c.GlobalStatsInterval <= 0 {
+		c.GlobalStatsInterval = 15 * time.Second
+	}
+	if c.EnableRateLimit && c.RateLimitRPS <= 0 {
+		c.RateLimitRPS = 1.0
+	}
+	if !c.EnableRateLimit && c.RateLimitRPS < 0 {
+		c.RateLimitRPS = 0
+	}
+	if c.TierHysteresisCache <= 0 {
+		c.TierHysteresisCache = 10000
+	}
+	if c.TierHysteresisWindow < 0 {
+		c.TierHysteresisWindow = 0
+	}
+	if c.TierHysteresisTTL <= 0 {
+		c.TierHysteresisTTL = 10 * time.Minute
+	}
+	if c.EnableVisitedSnapshot && c.VisitedSnapshotThreshold <= 0 {
+		c.VisitedSnapshotThreshold = 5_000_000
+	}
+	if c.RobotsPolicy == "" {
+		c.RobotsPolicy = "log"
+	}
 
 	// Создание директорий
 	for _, dir := range []string{c.DiskQueueDir, c.CheckpointDir, c.OutputDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
+	}
+
+	if c.GlobalStatsPath == "" {
+		c.GlobalStatsPath = filepath.Join(c.OutputDir, "global_stats.json")
 	}
 
 	return nil
@@ -261,6 +354,231 @@ func (l *Logger) Error(msg string, fields map[string]interface{}) {
 }
 
 // ============================================================================
+// RATE LIMITER
+// ============================================================================
+
+type RateLimiter struct {
+	mu         sync.Mutex
+	tokens     float64
+	capacity   float64
+	refillRate float64
+	last       time.Time
+}
+
+func NewRateLimiter(rps float64) *RateLimiter {
+	if rps <= 0 {
+		rps = 1
+	}
+	return &RateLimiter{
+		tokens:     rps,
+		capacity:   rps,
+		refillRate: rps,
+		last:       time.Now(),
+	}
+}
+
+func (rl *RateLimiter) Wait(ctx context.Context) error {
+	if rl == nil {
+		return nil
+	}
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	for {
+		now := time.Now()
+		elapsed := now.Sub(rl.last).Seconds()
+		if elapsed > 0 {
+			rl.tokens = math.Min(rl.capacity, rl.tokens+elapsed*rl.refillRate)
+			rl.last = now
+		}
+
+		if rl.tokens >= 1 {
+			rl.tokens -= 1
+			return nil
+		}
+
+		deficit := 1 - rl.tokens
+		waitDuration := time.Duration(deficit / rl.refillRate * float64(time.Second))
+		if waitDuration < 10*time.Millisecond {
+			waitDuration = 10 * time.Millisecond
+		}
+
+		rl.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(waitDuration):
+		}
+		rl.mu.Lock()
+	}
+}
+
+// ============================================================================
+// ROBOTS.TXT CHECKER
+// ============================================================================
+
+type RobotsAgent struct {
+	mu        sync.Mutex
+	domain    string
+	policy    string
+	fetched   bool
+	disallow  []string
+	allow     []string
+	client    *HTTPClient
+	logger    *Logger
+	lastFetch time.Time
+}
+
+func NewRobotsAgent(domain, policy string, client *HTTPClient, logger *Logger) *RobotsAgent {
+	return &RobotsAgent{domain: domain, policy: strings.ToLower(policy), client: client, logger: logger}
+}
+
+func (ra *RobotsAgent) Check(ctx context.Context, rawURL string) (bool, string) {
+	if ra == nil {
+		return true, ""
+	}
+
+	ra.mu.Lock()
+	if !ra.fetched {
+		ra.fetch(ctx)
+	}
+	ra.mu.Unlock()
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return true, ""
+	}
+
+	path := u.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+
+	// Allow rules override disallow
+	for _, allow := range ra.allow {
+		if allow == "" {
+			continue
+		}
+		if robotsMatch(path, allow) {
+			return true, ""
+		}
+	}
+
+	for _, dis := range ra.disallow {
+		if dis == "" {
+			continue
+		}
+		if robotsMatch(path, dis) {
+			if ra.policy == "respect" {
+				return false, dis
+			}
+			return true, dis
+		}
+	}
+
+	return true, ""
+}
+
+func (ra *RobotsAgent) fetch(ctx context.Context) {
+	ra.fetched = true
+
+	if ra.client == nil {
+		return
+	}
+
+	robotsURLs := []string{
+		fmt.Sprintf("https://%s/robots.txt", ra.domain),
+		fmt.Sprintf("http://%s/robots.txt", ra.domain),
+	}
+
+	for _, robotsURL := range robotsURLs {
+		body, metadata, err := ra.client.Fetch(ctx, robotsURL)
+		if err != nil {
+			ra.logger.Trace("robots fetch failed", map[string]interface{}{"domain": ra.domain, "url": robotsURL, "error": err.Error()})
+			continue
+		}
+
+		content := string(body)
+		disallow, allow := parseRobots(content)
+		ra.disallow = disallow
+		ra.allow = allow
+		ra.lastFetch = time.Now()
+		ra.logger.Trace("robots loaded", map[string]interface{}{"domain": ra.domain, "url": metadata.URL, "disallow": len(disallow)})
+		return
+	}
+}
+
+func parseRobots(content string) ([]string, []string) {
+	var disallow []string
+	var allow []string
+	applies := false
+
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		lower := strings.ToLower(line)
+		switch {
+		case strings.HasPrefix(lower, "user-agent:"):
+			agent := strings.TrimSpace(line[len("user-agent:"):])
+			agent = strings.ToLower(agent)
+			applies = agent == "*" || agent == ""
+		case applies && strings.HasPrefix(lower, "disallow:"):
+			rule := strings.TrimSpace(line[len("disallow:"):])
+			disallow = append(disallow, rule)
+		case applies && strings.HasPrefix(lower, "allow:"):
+			rule := strings.TrimSpace(line[len("allow:"):])
+			allow = append(allow, rule)
+		}
+	}
+
+	// Учитываем длину allow для последующей проверки (длинные приоритетнее)
+	sort.SliceStable(allow, func(i, j int) bool { return len(allow[i]) > len(allow[j]) })
+
+	return disallow, allow
+}
+
+func robotsMatch(path, pattern string) bool {
+	if pattern == "" {
+		return false
+	}
+	if pattern == "/" {
+		return true
+	}
+
+	if strings.Contains(pattern, "*") {
+		parts := strings.Split(pattern, "*")
+		idx := 0
+		for i, part := range parts {
+			if part == "" {
+				continue
+			}
+			pos := strings.Index(path[idx:], part)
+			if pos == -1 {
+				return false
+			}
+			idx += pos + len(part)
+			if i == 0 && !strings.HasPrefix(path, part) {
+				return false
+			}
+		}
+		if !strings.HasSuffix(pattern, "*") && !strings.HasSuffix(path, parts[len(parts)-1]) {
+			return false
+		}
+		return true
+	}
+
+	return strings.HasPrefix(path, pattern)
+}
+
+// ============================================================================
 // МОДЕЛИ ДАННЫХ
 // ============================================================================
 
@@ -306,71 +624,133 @@ type DomainState struct {
 // ============================================================================
 
 type VisitedStore struct {
-	mu      sync.RWMutex
-	visited map[string]struct{}
+	mu                sync.RWMutex
+	hot               map[string]struct{}
+	cold              map[uint64]struct{}
+	first             map[uint64]string
+	collisions        map[uint64]map[string]struct{}
+	snapshotThreshold int
+	snapshotPath      string
+	total             int64
 }
 
 func NewVisitedStore() *VisitedStore {
 	return &VisitedStore{
-		visited: make(map[string]struct{}),
+		hot:        make(map[string]struct{}),
+		cold:       make(map[uint64]struct{}),
+		first:      make(map[uint64]string),
+		collisions: make(map[uint64]map[string]struct{}),
 	}
+}
+
+func (v *VisitedStore) ConfigureSnapshot(path string, threshold int) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.snapshotPath = path
+	v.snapshotThreshold = threshold
 }
 
 func (v *VisitedStore) LoadOrStore(url string) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if _, exists := v.visited[url]; exists {
+	if _, exists := v.hot[url]; exists {
 		return true
 	}
-	v.visited[url] = struct{}{}
+	if v.existsInCold(url) {
+		return true
+	}
+
+	v.hot[url] = struct{}{}
+	v.total++
+	v.maybeSnapshotLocked()
 	return false
 }
 
 func (v *VisitedStore) Contains(url string) bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	_, exists := v.visited[url]
-	return exists
+
+	if _, exists := v.hot[url]; exists {
+		return true
+	}
+
+	return v.existsInCold(url)
 }
 
 func (v *VisitedStore) Size() int {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return len(v.visited)
+	return int(v.total)
 }
 
 func (v *VisitedStore) Save(path string) error {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if path != "" {
+		v.snapshotPath = path
+	}
+
+	urls := make([]string, 0, len(v.hot)+len(v.first))
+	for _, url := range v.first {
+		urls = append(urls, url)
+	}
+	for _, bucket := range v.collisions {
+		for url := range bucket {
+			if url != "" {
+				urls = append(urls, url)
+			}
+		}
+	}
+	for url := range v.hot {
+		urls = append(urls, url)
+	}
+
+	sort.Strings(urls)
 
 	tmpPath := path + ".tmp"
 	f, err := os.Create(tmpPath)
 	if err != nil {
 		return fmt.Errorf("create visited tmp file: %w", err)
 	}
-	defer f.Close()
 
 	w := bufio.NewWriter(f)
-	for url := range v.visited {
+	for _, url := range urls {
+		if url == "" {
+			continue
+		}
 		if _, err := w.WriteString(url + "\n"); err != nil {
+			f.Close()
+			os.Remove(tmpPath)
 			return fmt.Errorf("write visited url: %w", err)
 		}
 	}
 
 	if err := w.Flush(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("flush visited: %w", err)
 	}
 	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("sync visited: %w", err)
 	}
 	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
 		return fmt.Errorf("close visited: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("rename visited: %w", err)
 	}
+
+	// После успешного сохранения очищаем hot и переносим в cold
+	for url := range v.hot {
+		v.addCold(url)
+	}
+	v.hot = make(map[string]struct{})
 
 	return nil
 }
@@ -379,6 +759,7 @@ func (v *VisitedStore) Load(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			v.ConfigureSnapshot(path, v.snapshotThreshold)
 			return nil
 		}
 		return fmt.Errorf("open visited: %w", err)
@@ -388,20 +769,120 @@ func (v *VisitedStore) Load(path string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	scanner := bufio.NewScanner(f)
+	v.snapshotPath = path
 
-	// Увеличение буфера до 16 МБ для обработки длинных URL
+	scanner := bufio.NewScanner(f)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 16*1024*1024)
 
 	for scanner.Scan() {
 		url := strings.TrimSpace(scanner.Text())
-		if url != "" {
-			v.visited[url] = struct{}{}
+		if url == "" {
+			continue
+		}
+		if !v.existsInCold(url) {
+			v.addCold(url)
+			v.total++
 		}
 	}
 
 	return scanner.Err()
+}
+
+func (v *VisitedStore) maybeSnapshotLocked() {
+	if v.snapshotThreshold <= 0 || len(v.hot) < v.snapshotThreshold {
+		return
+	}
+	if v.snapshotPath == "" {
+		return
+	}
+
+	urls := make([]string, 0, len(v.hot))
+	for url := range v.hot {
+		urls = append(urls, url)
+	}
+
+	if len(urls) == 0 {
+		return
+	}
+
+	file, err := os.OpenFile(v.snapshotPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+
+	writer := bufio.NewWriter(file)
+	for _, url := range urls {
+		if _, err := writer.WriteString(url + "\n"); err != nil {
+			file.Close()
+			return
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		file.Close()
+		return
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return
+	}
+	if err := file.Close(); err != nil {
+		return
+	}
+
+	for _, url := range urls {
+		v.addCold(url)
+		delete(v.hot, url)
+	}
+}
+
+func (v *VisitedStore) existsInCold(url string) bool {
+	hash := hashURL(url)
+	if _, ok := v.cold[hash]; !ok {
+		return false
+	}
+
+	if first, ok := v.first[hash]; ok {
+		if first == url {
+			return true
+		}
+	}
+
+	if bucket, ok := v.collisions[hash]; ok {
+		if _, exists := bucket[url]; exists {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (v *VisitedStore) addCold(url string) {
+	hash := hashURL(url)
+	if _, ok := v.cold[hash]; !ok {
+		v.cold[hash] = struct{}{}
+		v.first[hash] = url
+		return
+	}
+
+	if existing, ok := v.first[hash]; ok {
+		if existing == url {
+			return
+		}
+	}
+
+	bucket := v.collisions[hash]
+	if bucket == nil {
+		bucket = make(map[string]struct{})
+	}
+	bucket[url] = struct{}{}
+	v.collisions[hash] = bucket
+}
+
+func hashURL(url string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(url))
+	return h.Sum64()
 }
 
 // ============================================================================
@@ -882,6 +1363,177 @@ func (rw *ResultWriter) Close() error {
 }
 
 // ============================================================================
+// GLOBAL STATS MANAGER
+// ============================================================================
+
+type GlobalStatsSnapshot struct {
+	Version          int64            `json:"version"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+	Pages            int64            `json:"pages"`
+	Findings         int64            `json:"findings"`
+	TierCounts       map[string]int64 `json:"tier_counts"`
+	ErrorsByKind     map[string]int64 `json:"errors_by_kind"`
+	DomainsCompleted []string         `json:"domains_completed"`
+}
+
+type GlobalStatsManager struct {
+	mu       sync.Mutex
+	snapshot GlobalStatsSnapshot
+	output   string
+	interval time.Duration
+	logger   *Logger
+	ticker   *time.Ticker
+	stop     chan struct{}
+	domains  map[string]struct{}
+	closed   int32
+}
+
+func NewGlobalStatsManager(path string, interval time.Duration, logger *Logger) *GlobalStatsManager {
+	gsm := &GlobalStatsManager{
+		snapshot: GlobalStatsSnapshot{
+			Version:      1,
+			TierCounts:   make(map[string]int64),
+			ErrorsByKind: make(map[string]int64),
+		},
+		output:   path,
+		interval: interval,
+		logger:   logger,
+		stop:     make(chan struct{}),
+		domains:  make(map[string]struct{}),
+	}
+
+	if interval > 0 {
+		gsm.ticker = time.NewTicker(interval)
+		go gsm.loop()
+	}
+
+	return gsm
+}
+
+func (gsm *GlobalStatsManager) loop() {
+	for {
+		select {
+		case <-gsm.stop:
+			return
+		case <-gsm.ticker.C:
+			if err := gsm.Flush(); err != nil {
+				gsm.logger.Warn("failed to flush global stats", map[string]interface{}{"error": err.Error()})
+			}
+		}
+	}
+}
+
+func (gsm *GlobalStatsManager) RecordPage(domain string) {
+	gsm.mu.Lock()
+	gsm.snapshot.Pages++
+	gsm.mu.Unlock()
+}
+
+func (gsm *GlobalStatsManager) RecordFinding(domain string, tier int) {
+	gsm.mu.Lock()
+	gsm.snapshot.Findings++
+	tierKey := fmt.Sprintf("tier_%d", tier)
+	gsm.snapshot.TierCounts[tierKey]++
+	gsm.mu.Unlock()
+}
+
+func (gsm *GlobalStatsManager) RecordError(kind string) {
+	gsm.mu.Lock()
+	if kind == "" {
+		kind = "unknown"
+	}
+	gsm.snapshot.ErrorsByKind[kind]++
+	gsm.mu.Unlock()
+}
+
+func (gsm *GlobalStatsManager) MarkDomainCompleted(domain string) {
+	gsm.mu.Lock()
+	if domain != "" {
+		gsm.domains[domain] = struct{}{}
+	}
+	gsm.mu.Unlock()
+}
+
+func (gsm *GlobalStatsManager) Flush() error {
+	gsm.mu.Lock()
+	defer gsm.mu.Unlock()
+
+	if gsm.output == "" {
+		return nil
+	}
+
+	gsm.snapshot.UpdatedAt = time.Now().UTC()
+
+	domains := make([]string, 0, len(gsm.domains))
+	for domain := range gsm.domains {
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+
+	snapshot := GlobalStatsSnapshot{
+		Version:          gsm.snapshot.Version,
+		UpdatedAt:        gsm.snapshot.UpdatedAt,
+		Pages:            gsm.snapshot.Pages,
+		Findings:         gsm.snapshot.Findings,
+		TierCounts:       make(map[string]int64, len(gsm.snapshot.TierCounts)),
+		ErrorsByKind:     make(map[string]int64, len(gsm.snapshot.ErrorsByKind)),
+		DomainsCompleted: domains,
+	}
+
+	for k, v := range gsm.snapshot.TierCounts {
+		snapshot.TierCounts[k] = v
+	}
+	for k, v := range gsm.snapshot.ErrorsByKind {
+		snapshot.ErrorsByKind[k] = v
+	}
+
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal global stats: %w", err)
+	}
+
+	tmpPath := gsm.output + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create global stats tmp: %w", err)
+	}
+
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write global stats tmp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("sync global stats tmp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close global stats tmp: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, gsm.output); err != nil {
+		return fmt.Errorf("rename global stats: %w", err)
+	}
+
+	return nil
+}
+
+func (gsm *GlobalStatsManager) Close() error {
+	if !atomic.CompareAndSwapInt32(&gsm.closed, 0, 1) {
+		return nil
+	}
+
+	if gsm.ticker != nil {
+		gsm.ticker.Stop()
+	}
+	close(gsm.stop)
+
+	return gsm.Flush()
+}
+
+// ============================================================================
 // URL NORMALIZATION & EXTRACTION
 // ============================================================================
 
@@ -967,10 +1619,9 @@ func isSameDomain(urlStr string, domain string) bool {
 	return host == domain || strings.HasSuffix(host, "."+domain)
 }
 
-func extractLinks(htmlContent []byte, baseURL *url.URL, domain string) ([]string, error) {
-	doc, err := parseHTML(bytes.NewReader(htmlContent))
-	if err != nil {
-		return nil, fmt.Errorf("parse html: %w", err)
+func extractLinks(doc *HTMLNode, baseURL *url.URL, domain string) ([]string, error) {
+	if doc == nil {
+		return nil, errors.New("nil document")
 	}
 
 	seen := make(map[string]bool)
@@ -1006,6 +1657,49 @@ func extractLinks(htmlContent []byte, baseURL *url.URL, domain string) ([]string
 
 	walk(doc)
 	return links, nil
+}
+
+func extractCanonicalURL(doc *HTMLNode, baseURL *url.URL, domain string) string {
+	if doc == nil {
+		return ""
+	}
+
+	var canonical string
+	var walk func(*HTMLNode)
+	walk = func(n *HTMLNode) {
+		if canonical != "" {
+			return
+		}
+		if n.Type == HTMLElementNode && n.Data == "link" {
+			var rel, href string
+			for _, attr := range n.Attr {
+				switch strings.ToLower(attr.Key) {
+				case "rel":
+					rel = strings.ToLower(attr.Val)
+				case "href":
+					href = attr.Val
+				}
+			}
+			if strings.Contains(rel, "canonical") && href != "" {
+				if normalized, err := normalizeURL(href, baseURL); err == nil {
+					if isSameDomain(normalized, domain) {
+						canonical = normalized
+						return
+					}
+				}
+			}
+		}
+
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+			if canonical != "" {
+				return
+			}
+		}
+	}
+
+	walk(doc)
+	return canonical
 }
 
 // ============================================================================
@@ -1222,6 +1916,19 @@ var koi8rTable = func() [256]rune {
 // HTTP CLIENT & FETCHING
 // ============================================================================
 
+var ErrRedirectLoop = errors.New("redirect loop detected")
+
+type HTTPStatusError struct {
+	StatusCode int
+	URL        string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("http status %d", e.StatusCode)
+}
+
+type redirectContextKey struct{}
+
 type HTTPClient struct {
 	client *http.Client
 	config *Config
@@ -1245,15 +1952,28 @@ func NewHTTPClient(config *Config, logger *Logger) *HTTPClient {
 		},
 	}
 
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   config.HTTPTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= config.MaxRedirects {
-				return fmt.Errorf("too many redirects")
+	checkRedirect := func(req *http.Request, via []*http.Request) error {
+		if len(via) >= config.MaxRedirects {
+			return fmt.Errorf("too many redirects")
+		}
+		if config.EnableRedirectLoop {
+			if chainPtr, ok := req.Context().Value(redirectContextKey{}).(*[]string); ok && chainPtr != nil {
+				current := req.URL.String()
+				for _, prev := range *chainPtr {
+					if prev == current {
+						return ErrRedirectLoop
+					}
+				}
+				*chainPtr = append(*chainPtr, current)
 			}
-			return nil
-		},
+		}
+		return nil
+	}
+
+	client := &http.Client{
+		Transport:     transport,
+		Timeout:       config.HTTPTimeout,
+		CheckRedirect: checkRedirect,
 	}
 
 	return &HTTPClient{
@@ -1264,6 +1984,66 @@ func NewHTTPClient(config *Config, logger *Logger) *HTTPClient {
 }
 
 func (hc *HTTPClient) Fetch(ctx context.Context, urlStr string) ([]byte, *PageMetadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	attempts := 1
+	if hc.config.EnableRetry && hc.config.MaxRetries > attempts {
+		attempts = hc.config.MaxRetries
+	}
+
+	var lastErr error
+	var lastMeta *PageMetadata
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		chain := []string{urlStr}
+		attemptCtx := context.WithValue(ctx, redirectContextKey{}, &chain)
+
+		start := time.Now()
+		body, metadata, err := hc.fetchOnce(attemptCtx, urlStr, &chain)
+		elapsed := time.Since(start)
+
+		fields := map[string]interface{}{
+			"url":        urlStr,
+			"attempt":    fmt.Sprintf("%d/%d", attempt, attempts),
+			"elapsed_ms": elapsed.Milliseconds(),
+		}
+		if metadata != nil {
+			if metadata.StatusCode != 0 {
+				fields["status"] = metadata.StatusCode
+			}
+			if len(metadata.RedirectChain) > 0 {
+				fields["redirects"] = len(metadata.RedirectChain)
+			}
+		}
+
+		if err != nil {
+			fields["error"] = err.Error()
+			hc.logger.Trace("http_fetch", fields)
+			lastErr = err
+			lastMeta = metadata
+			if !hc.shouldRetry(err, metadata) || attempt == attempts {
+				return nil, metadata, err
+			}
+
+			backoff := hc.backoffDuration(attempt)
+			select {
+			case <-ctx.Done():
+				return nil, metadata, ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
+		}
+
+		hc.logger.Trace("http_fetch", fields)
+		return body, metadata, nil
+	}
+
+	return nil, lastMeta, lastErr
+}
+
+func (hc *HTTPClient) fetchOnce(ctx context.Context, urlStr string, chain *[]string) ([]byte, *PageMetadata, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create request: %w", err)
@@ -1276,29 +2056,28 @@ func (hc *HTTPClient) Fetch(ctx context.Context, urlStr string) ([]byte, *PageMe
 
 	resp, err := hc.client.Do(req)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return nil, nil, fmt.Errorf("timeout or canceled: %w", err)
-		}
-		return nil, nil, fmt.Errorf("do request: %w", err)
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
 	metadata := &PageMetadata{
-		URL:           urlStr,
+		URL:           resp.Request.URL.String(),
 		StatusCode:    resp.StatusCode,
 		ContentType:   resp.Header.Get("Content-Type"),
 		ContentLength: resp.ContentLength,
 		LastModified:  resp.Header.Get("Last-Modified"),
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return nil, metadata, fmt.Errorf("bad status code: %d", resp.StatusCode)
+	if chain != nil {
+		metadata.RedirectChain = append([]string(nil), *chain...)
 	}
 
-	// Ограничение размера
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return nil, metadata, &HTTPStatusError{StatusCode: resp.StatusCode, URL: metadata.URL}
+	}
+
 	limitedReader := io.LimitReader(resp.Body, hc.config.MaxBodySize)
 
-	// Декомпрессия
 	var reader io.Reader = limitedReader
 	var closer io.Closer
 	encoding := resp.Header.Get("Content-Encoding")
@@ -1317,7 +2096,6 @@ func (hc *HTTPClient) Fetch(ctx context.Context, urlStr string) ([]byte, *PageMe
 		closer = flateReader.(io.Closer)
 	}
 
-	// Обязательное закрытие декомпрессора
 	if closer != nil {
 		defer closer.Close()
 	}
@@ -1326,7 +2104,7 @@ func (hc *HTTPClient) Fetch(ctx context.Context, urlStr string) ([]byte, *PageMe
 	if err != nil {
 		if len(body) > 0 {
 			hc.logger.Warn("partial read", map[string]interface{}{
-				"url":   urlStr,
+				"url":   metadata.URL,
 				"error": err.Error(),
 				"bytes": len(body),
 			})
@@ -1339,14 +2117,13 @@ func (hc *HTTPClient) Fetch(ctx context.Context, urlStr string) ([]byte, *PageMe
 		return nil, metadata, fmt.Errorf("body too large: %d bytes", len(body))
 	}
 
-	// Определение кодировки и конвертация
 	charset := detectCharset(metadata.ContentType, body)
 	metadata.Charset = charset
 
 	utf8Body, err := convertToUTF8(body, charset)
 	if err != nil {
 		hc.logger.Warn("encoding conversion failed", map[string]interface{}{
-			"url":     urlStr,
+			"url":     metadata.URL,
 			"charset": charset,
 			"error":   err.Error(),
 		})
@@ -1354,6 +2131,126 @@ func (hc *HTTPClient) Fetch(ctx context.Context, urlStr string) ([]byte, *PageMe
 	}
 
 	return utf8Body, metadata, nil
+}
+
+func (hc *HTTPClient) shouldRetry(err error, metadata *PageMetadata) bool {
+	if !hc.config.EnableRetry {
+		return false
+	}
+
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, ErrRedirectLoop) {
+		return false
+	}
+
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.StatusCode == 429 || (statusErr.StatusCode >= 500 && statusErr.StatusCode < 600) {
+			return true
+		}
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if urlErr.Timeout() {
+			return true
+		}
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() || netErr.Temporary() {
+			return true
+		}
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+
+	if metadata != nil {
+		if metadata.StatusCode == 429 || (metadata.StatusCode >= 500 && metadata.StatusCode < 600) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (hc *HTTPClient) backoffDuration(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	base := hc.config.RetryBaseBackoff
+	if base <= 0 {
+		base = 500 * time.Millisecond
+	}
+	multiplier := time.Duration(1 << uint(attempt-1))
+	jitter := time.Duration(randomFloat64() * float64(base))
+	return multiplier*base + jitter
+}
+
+func classifyErrorKind(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		switch {
+		case statusErr.StatusCode == 429:
+			return "http_429"
+		case statusErr.StatusCode >= 500 && statusErr.StatusCode < 600:
+			return "http_5xx"
+		case statusErr.StatusCode >= 400 && statusErr.StatusCode < 500:
+			return "http_4xx"
+		}
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns_error"
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if urlErr.Timeout() {
+			return "timeout"
+		}
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "timeout"
+		}
+	}
+
+	if errors.Is(err, ErrRedirectLoop) {
+		return "redirect_loop"
+	}
+
+	return "network_error"
 }
 
 // ============================================================================
@@ -1486,9 +2383,110 @@ var commentSystems = []string{
 	"wp-comments", "wordpress-comments",
 }
 
-func detectComments(htmlContent []byte, metadata *PageMetadata) (*Finding, bool) {
-	doc, err := parseHTML(bytes.NewReader(htmlContent))
-	if err != nil {
+type tierCacheEntry struct {
+	Confidence float64
+	Tier       int
+	Expiry     time.Time
+}
+
+type TierClassifier struct {
+	mu                 sync.Mutex
+	window             float64
+	ttl                time.Duration
+	capacity           int
+	enableHysteresis   bool
+	enableLastModified bool
+	entries            map[string]tierCacheEntry
+	order              []string
+}
+
+func NewTierClassifier(config *Config) *TierClassifier {
+	tc := &TierClassifier{
+		window:             config.TierHysteresisWindow,
+		ttl:                config.TierHysteresisTTL,
+		capacity:           config.TierHysteresisCache,
+		enableHysteresis:   config.EnableTierHysteresis,
+		enableLastModified: config.EnableLastModifiedBonus,
+		entries:            make(map[string]tierCacheEntry),
+	}
+	return tc
+}
+
+func (tc *TierClassifier) Classify(url string, baseConfidence float64, metadata *PageMetadata) (int, float64) {
+	confidence := baseConfidence
+	if confidence < 0 {
+		confidence = 0
+	}
+	if confidence > 1 {
+		confidence = 1
+	}
+
+	if tc.enableLastModified && metadata != nil {
+		if lm, err := http.ParseTime(metadata.LastModified); err == nil {
+			age := time.Since(lm)
+			if age >= 0 && age <= 90*24*time.Hour {
+				freshness := 1 - age.Hours()/(90*24)
+				if freshness < 0 {
+					freshness = 0
+				}
+				bonus := 0.05 + 0.05*freshness
+				if bonus > 0.1 {
+					bonus = 0.1
+				}
+				confidence = math.Min(1, confidence+bonus)
+			}
+		}
+	}
+
+	tier := tierFromConfidence(confidence)
+
+	if !tc.enableHysteresis || url == "" {
+		tc.store(url, tier, confidence)
+		return tier, confidence
+	}
+
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	now := time.Now()
+	if entry, ok := tc.entries[url]; ok && now.Before(entry.Expiry) {
+		if entry.Tier != tier {
+			if math.Abs(confidence-entry.Confidence) <= tc.window {
+				tier = entry.Tier
+				confidence = entry.Confidence
+			}
+		}
+	}
+
+	tc.entries[url] = tierCacheEntry{Confidence: confidence, Tier: tier, Expiry: now.Add(tc.ttl)}
+	tc.order = append(tc.order, url)
+	if len(tc.order) > tc.capacity {
+		oldest := tc.order[0]
+		tc.order = tc.order[1:]
+		delete(tc.entries, oldest)
+	}
+
+	return tier, confidence
+}
+
+func (tc *TierClassifier) store(url string, tier int, confidence float64) {
+	if url == "" || !tc.enableHysteresis {
+		return
+	}
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	now := time.Now()
+	tc.entries[url] = tierCacheEntry{Confidence: confidence, Tier: tier, Expiry: now.Add(tc.ttl)}
+	tc.order = append(tc.order, url)
+	if len(tc.order) > tc.capacity {
+		oldest := tc.order[0]
+		tc.order = tc.order[1:]
+		delete(tc.entries, oldest)
+	}
+}
+
+func detectComments(doc *HTMLNode, htmlLower string, metadata *PageMetadata) (*Finding, bool) {
+	if doc == nil {
 		return nil, false
 	}
 
@@ -1496,7 +2494,6 @@ func detectComments(htmlContent []byte, metadata *PageMetadata) (*Finding, bool)
 	confidence := 0.0
 
 	// Проверка систем комментирования
-	htmlLower := strings.ToLower(string(htmlContent))
 	for _, sys := range commentSystems {
 		if strings.Contains(htmlLower, sys) {
 			signals = append(signals, Signal{
@@ -1794,36 +2791,30 @@ func renderNode(n *HTMLNode) string {
 // TIER CLASSIFICATION
 // ============================================================================
 
-func classifyFindingTier(confidence float64, signals []string) (int, string) {
-	const (
-		tier1Threshold = 0.85
-		tier2Threshold = 0.70
-		tier3Threshold = 0.50
-		hysteresis     = 0.02
-	)
-
-	// Проверка на явные системы комментирования
-	hasExplicitSystem := false
-	for _, sig := range signals {
-		if strings.HasPrefix(sig, "comment_system:") {
-			hasExplicitSystem = true
-			break
-		}
+func tierFromConfidence(confidence float64) int {
+	switch {
+	case confidence >= 0.85:
+		return 1
+	case confidence >= 0.70:
+		return 2
+	case confidence >= 0.50:
+		return 3
+	default:
+		return 4
 	}
+}
 
-	if confidence >= tier1Threshold || (confidence >= tier1Threshold-hysteresis && hasExplicitSystem) {
-		return 1, "абсолютная"
+func tierLabel(tier int) string {
+	switch tier {
+	case 1:
+		return "абсолютная"
+	case 2:
+		return "вроде как можно разместить"
+	case 3:
+		return "сомнительно, стоит проверить"
+	default:
+		return "нетипичный формат, может подойти"
 	}
-
-	if confidence >= tier2Threshold {
-		return 2, "вроде как можно разместить"
-	}
-
-	if confidence >= tier3Threshold {
-		return 3, "сомнительно, стоит проверить"
-	}
-
-	return 4, "нетипичный формат, может подойти"
 }
 
 // ============================================================================
@@ -1930,16 +2921,20 @@ func sanitizeDomainName(domain string) string {
 // ============================================================================
 
 type DomainCrawler struct {
-	domain       string
-	config       *Config
-	httpClient   *HTTPClient
-	resultWriter *ResultWriter
-	visited      *VisitedStore
-	ramQueue     *PriorityQueue
-	diskQueue    *DiskQueue
-	prioritizer  *LinkPrioritizer
-	checkpoint   *CheckpointManager
-	logger       *Logger
+	domain         string
+	config         *Config
+	httpClient     *HTTPClient
+	resultWriter   *ResultWriter
+	visited        *VisitedStore
+	ramQueue       *PriorityQueue
+	diskQueue      *DiskQueue
+	prioritizer    *LinkPrioritizer
+	checkpoint     *CheckpointManager
+	logger         *Logger
+	stats          *GlobalStatsManager
+	tierClassifier *TierClassifier
+	rateLimiter    *RateLimiter
+	robots         *RobotsAgent
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -1960,6 +2955,7 @@ func NewDomainCrawler(
 	httpClient *HTTPClient,
 	resultWriter *ResultWriter,
 	checkpoint *CheckpointManager,
+	stats *GlobalStatsManager,
 	logger *Logger,
 ) (*DomainCrawler, error) {
 
@@ -1975,21 +2971,42 @@ func NewDomainCrawler(
 		return nil, fmt.Errorf("create disk queue: %w", err)
 	}
 
-	dc := &DomainCrawler{
-		domain:       domain,
-		config:       config,
-		httpClient:   httpClient,
-		resultWriter: resultWriter,
-		visited:      NewVisitedStore(),
-		ramQueue:     NewPriorityQueue(),
-		diskQueue:    diskQueue,
-		prioritizer:  NewLinkPrioritizer(),
-		checkpoint:   checkpoint,
-		logger:       logger,
-		ctx:          ctx,
-		cancel:       cancel,
-		lastActivity: time.Now(),
+	var rateLimiter *RateLimiter
+	if config.EnableRateLimit {
+		rateLimiter = NewRateLimiter(config.RateLimitRPS)
 	}
+
+	var robots *RobotsAgent
+	if strings.ToLower(config.RobotsPolicy) != "off" {
+		robots = NewRobotsAgent(domain, config.RobotsPolicy, httpClient, logger)
+	}
+
+	dc := &DomainCrawler{
+		domain:         domain,
+		config:         config,
+		httpClient:     httpClient,
+		resultWriter:   resultWriter,
+		visited:        NewVisitedStore(),
+		ramQueue:       NewPriorityQueue(),
+		diskQueue:      diskQueue,
+		prioritizer:    NewLinkPrioritizer(),
+		checkpoint:     checkpoint,
+		logger:         logger,
+		stats:          stats,
+		tierClassifier: NewTierClassifier(config),
+		rateLimiter:    rateLimiter,
+		robots:         robots,
+		ctx:            ctx,
+		cancel:         cancel,
+		lastActivity:   time.Now(),
+	}
+
+	visitedPath := filepath.Join(config.CheckpointDir, sanitizeDomainName(domain)+"_visited.jsonl")
+	threshold := 0
+	if config.EnableVisitedSnapshot {
+		threshold = config.VisitedSnapshotThreshold
+	}
+	dc.visited.ConfigureSnapshot(visitedPath, threshold)
 
 	// Загрузка состояния
 	if err := dc.loadState(); err != nil {
@@ -2043,12 +3060,18 @@ func (dc *DomainCrawler) saveState() error {
 	}
 
 	if err := dc.checkpoint.SaveDomainState(dc.domain, state); err != nil {
+		if dc.stats != nil {
+			dc.stats.RecordError("checkpoint_save")
+		}
 		return err
 	}
 
 	// Сохранение visited
 	visitedPath := filepath.Join(dc.config.CheckpointDir, sanitizeDomainName(dc.domain)+"_visited.jsonl")
 	if err := dc.visited.Save(visitedPath); err != nil {
+		if dc.stats != nil {
+			dc.stats.RecordError("visited_save")
+		}
 		return err
 	}
 
@@ -2147,6 +3170,9 @@ func (dc *DomainCrawler) enqueueURL(urlStr string, priority float64, depth int) 
 				"url":   urlStr,
 				"error": err.Error(),
 			})
+			if dc.stats != nil {
+				dc.stats.RecordError("disk_queue_push")
+			}
 		}
 	}
 
@@ -2215,6 +3241,9 @@ func (dc *DomainCrawler) dequeueURL() (URLItem, bool) {
 			"domain": dc.domain,
 			"error":  err.Error(),
 		})
+		if dc.stats != nil {
+			dc.stats.RecordError("disk_queue_pop")
+		}
 		return URLItem{}, false
 	}
 
@@ -2247,6 +3276,39 @@ func (dc *DomainCrawler) processURL(item URLItem) {
 		"depth":    item.Depth,
 	})
 
+	if dc.robots != nil {
+		allowed, rule := dc.robots.Check(dc.ctx, item.URL)
+		if !allowed {
+			dc.logger.Info("blocked by robots", map[string]interface{}{
+				"domain": dc.domain,
+				"url":    item.URL,
+				"rule":   rule,
+			})
+			if dc.stats != nil {
+				dc.stats.RecordError("robots_blocked")
+			}
+			return
+		}
+		if rule != "" {
+			dc.logger.Trace("robots restriction", map[string]interface{}{
+				"domain": dc.domain,
+				"url":    item.URL,
+				"rule":   rule,
+			})
+		}
+	}
+
+	if dc.rateLimiter != nil {
+		if err := dc.rateLimiter.Wait(dc.ctx); err != nil {
+			dc.logger.Trace("rate limiter wait failed", map[string]interface{}{
+				"domain": dc.domain,
+				"url":    item.URL,
+				"error":  err.Error(),
+			})
+			return
+		}
+	}
+
 	// Контекст с таймаутом для запроса
 	ctx, cancel := context.WithTimeout(dc.ctx, dc.config.HTTPTimeout)
 	defer cancel()
@@ -2255,6 +3317,9 @@ func (dc *DomainCrawler) processURL(item URLItem) {
 	body, metadata, err := dc.httpClient.Fetch(ctx, item.URL)
 	if err != nil {
 		atomic.AddInt64(&dc.errors, 1)
+		if dc.stats != nil {
+			dc.stats.RecordError(classifyErrorKind(err))
+		}
 		dc.logger.Trace("fetch failed", map[string]interface{}{
 			"domain": dc.domain,
 			"url":    item.URL,
@@ -2264,28 +3329,69 @@ func (dc *DomainCrawler) processURL(item URLItem) {
 	}
 
 	atomic.AddInt64(&dc.pages, 1)
+	if dc.stats != nil {
+		dc.stats.RecordPage(dc.domain)
+	}
 	dc.updateActivity()
 
-	// Извлечение ссылок
-	baseURL, _ := url.Parse(item.URL)
-	links, err := extractLinks(body, baseURL, dc.domain)
+	baseURL, _ := url.Parse(metadata.URL)
+	doc, parseErr := parseHTML(bytes.NewReader(body))
+	if parseErr != nil {
+		atomic.AddInt64(&dc.errors, 1)
+		if dc.stats != nil {
+			dc.stats.RecordError("parse_html")
+		}
+		dc.logger.Warn("parse html failed", map[string]interface{}{
+			"domain": dc.domain,
+			"url":    metadata.URL,
+			"error":  parseErr.Error(),
+		})
+		return
+	}
+
+	if dc.config.EnableCanonicalDedup {
+		if canonical := extractCanonicalURL(doc, baseURL, dc.domain); canonical != "" && canonical != metadata.URL {
+			dc.logger.Trace("canonical detected", map[string]interface{}{
+				"domain":    dc.domain,
+				"url":       metadata.URL,
+				"canonical": canonical,
+			})
+			dc.visited.LoadOrStore(canonical)
+			metadata.URL = canonical
+			baseURL, _ = url.Parse(canonical)
+		}
+	}
+
+	htmlLower := strings.ToLower(string(body))
+
+	links, err := extractLinks(doc, baseURL, dc.domain)
 	if err != nil {
 		dc.logger.Trace("extract links failed", map[string]interface{}{
 			"domain": dc.domain,
-			"url":    item.URL,
+			"url":    metadata.URL,
 			"error":  err.Error(),
 		})
+		if dc.stats != nil {
+			dc.stats.RecordError("extract_links")
+		}
 	} else {
 		dc.enqueueLinks(links, item.Depth+1)
 	}
 
 	// Детекция комментариев
-	finding, detected := detectComments(body, metadata)
+	finding, detected := detectComments(doc, htmlLower, metadata)
 	if detected {
 		finding.Domain = dc.domain
-		tier, label := classifyFindingTier(finding.Confidence, finding.Signals)
-		finding.Tier = tier
-		finding.TierLabel = label
+		if dc.tierClassifier != nil {
+			tier, confidence := dc.tierClassifier.Classify(finding.URL, finding.Confidence, metadata)
+			finding.Confidence = confidence
+			finding.Tier = tier
+			finding.TierLabel = tierLabel(tier)
+		} else {
+			tier := tierFromConfidence(finding.Confidence)
+			finding.Tier = tier
+			finding.TierLabel = tierLabel(tier)
+		}
 
 		// Запись результата
 		if err := dc.resultWriter.WriteFinding(*finding); err != nil {
@@ -2294,15 +3400,21 @@ func (dc *DomainCrawler) processURL(item URLItem) {
 				"url":    item.URL,
 				"error":  err.Error(),
 			})
+			if dc.stats != nil {
+				dc.stats.RecordError("result_writer")
+			}
 		} else {
 			atomic.AddInt64(&dc.found, 1)
-			dc.prioritizer.RecordSuccess(item.URL)
+			dc.prioritizer.RecordSuccess(finding.URL)
+			if dc.stats != nil {
+				dc.stats.RecordFinding(dc.domain, finding.Tier)
+			}
 
 			dc.logger.Info("found comments", map[string]interface{}{
 				"domain":     dc.domain,
-				"url":        item.URL,
-				"tier":       tier,
-				"tier_label": label,
+				"url":        finding.URL,
+				"tier":       finding.Tier,
+				"tier_label": finding.TierLabel,
 				"confidence": finding.Confidence,
 			})
 		}
@@ -2433,6 +3545,9 @@ func (dc *DomainCrawler) checkpointLoop() {
 					"domain": dc.domain,
 					"error":  err.Error(),
 				})
+				if dc.stats != nil {
+					dc.stats.RecordError("checkpoint_save")
+				}
 			} else {
 				dc.logger.Trace("checkpoint saved", map[string]interface{}{
 					"domain": dc.domain,
@@ -2479,6 +3594,7 @@ type MainCrawler struct {
 	resultWriter *ResultWriter
 	checkpoint   *CheckpointManager
 	logger       *Logger
+	stats        *GlobalStatsManager
 
 	semaphore chan struct{}
 	wg        sync.WaitGroup
@@ -2512,6 +3628,8 @@ func NewMainCrawler(config *Config, domains []string, logger *Logger) (*MainCraw
 		return nil, fmt.Errorf("create checkpoint manager: %w", err)
 	}
 
+	stats := NewGlobalStatsManager(config.GlobalStatsPath, config.GlobalStatsInterval, logger)
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	maxDomains := config.MaxConcurrentDomains()
@@ -2523,6 +3641,7 @@ func NewMainCrawler(config *Config, domains []string, logger *Logger) (*MainCraw
 		resultWriter:     resultWriter,
 		checkpoint:       checkpoint,
 		logger:           logger,
+		stats:            stats,
 		semaphore:        make(chan struct{}, maxDomains),
 		ctx:              ctx,
 		cancel:           cancel,
@@ -2572,6 +3691,9 @@ func (mc *MainCrawler) Run(ctx context.Context) error {
 	if err := mc.resultWriter.Sync(); err != nil {
 		mc.logger.Warn("final sync failed", map[string]interface{}{"error": err.Error()})
 	}
+	if err := mc.stats.Flush(); err != nil {
+		mc.logger.Warn("final stats flush failed", map[string]interface{}{"error": err.Error()})
+	}
 
 	mc.logger.Info("main crawler finished", map[string]interface{}{
 		"completed_domains": len(mc.completedDomains),
@@ -2600,6 +3722,7 @@ func (mc *MainCrawler) processDomain(domain string) {
 		mc.httpClient,
 		mc.resultWriter,
 		mc.checkpoint,
+		mc.stats,
 		mc.logger,
 	)
 	if err != nil {
@@ -2620,6 +3743,7 @@ func (mc *MainCrawler) processDomain(domain string) {
 	}
 
 	mc.markCompleted(domain)
+	mc.stats.MarkDomainCompleted(domain)
 	mc.logger.Info("domain completed", map[string]interface{}{"domain": domain})
 }
 
@@ -2664,6 +3788,10 @@ func (mc *MainCrawler) Shutdown(ctx context.Context) error {
 		mc.logger.Warn("failed to close result writer", map[string]interface{}{"error": err.Error()})
 	}
 
+	if err := mc.stats.Close(); err != nil {
+		mc.logger.Warn("failed to close stats", map[string]interface{}{"error": err.Error()})
+	}
+
 	return nil
 }
 
@@ -2684,6 +3812,10 @@ type CLIFlags struct {
 	LogLevel         string
 	LogJSON          bool
 	WindowsMode      bool
+	RateLimit        bool
+	RateLimitRPS     float64
+	RespectRobots    bool
+	StatsInterval    time.Duration
 }
 
 func parseFlags() (*CLIFlags, error) {
@@ -2701,6 +3833,10 @@ func parseFlags() (*CLIFlags, error) {
 	flag.StringVar(&flags.LogLevel, "log-level", "INFO", "log level (TRACE/INFO/WARN/ERROR)")
 	flag.BoolVar(&flags.LogJSON, "log-json", false, "output logs as JSON")
 	flag.BoolVar(&flags.WindowsMode, "windows-mode", runtime.GOOS == "windows", "Windows compatibility mode")
+	flag.BoolVar(&flags.RateLimit, "rate-limit", false, "enable per-domain rate limiting")
+	flag.Float64Var(&flags.RateLimitRPS, "rate-limit-rps", 3.0, "requests per second when rate limit is enabled")
+	flag.BoolVar(&flags.RespectRobots, "respect-robots", false, "respect robots.txt disallow rules")
+	flag.DurationVar(&flags.StatsInterval, "stats-interval", 15*time.Second, "global stats flush interval")
 
 	flag.Parse()
 
@@ -2762,6 +3898,14 @@ func main() {
 	config.LogLevel = flags.LogLevel
 	config.LogJSON = flags.LogJSON
 	config.WindowsMode = flags.WindowsMode
+	config.EnableRateLimit = flags.RateLimit
+	config.RateLimitRPS = flags.RateLimitRPS
+	config.GlobalStatsInterval = flags.StatsInterval
+	if flags.RespectRobots {
+		config.RobotsPolicy = "respect"
+	} else {
+		config.RobotsPolicy = "log"
+	}
 
 	crawler, err := NewMainCrawler(config, domains, logger)
 	if err != nil {
