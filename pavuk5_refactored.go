@@ -8,7 +8,9 @@ import (
 	"container/heap"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -803,37 +805,65 @@ func (dc *DomainCrawler) fetch(raw string) (*goquery.Document, string, time.Time
 	if err != nil {
 		return nil, raw, time.Time{}, 0, err
 	}
-	req, err := http.NewRequestWithContext(dc.ctx, http.MethodGet, parsed.String(), nil)
-	if err != nil {
-		return nil, raw, time.Time{}, 0, err
+	current := parsed
+	attempts := 0
+	for {
+		req, err := http.NewRequestWithContext(dc.ctx, http.MethodGet, current.String(), nil)
+		if err != nil {
+			return nil, current.String(), time.Time{}, 0, err
+		}
+		req.Header.Set("User-Agent", dc.pickAgent())
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.8,ru;q=0.7")
+		res, err := dc.httpClient.Do(req)
+		if err != nil {
+			if attempts == 0 && current.Scheme == "https" && shouldDowngradeTLS(err) {
+				attempts++
+				current.Scheme = "http"
+				raw = current.String()
+				continue
+			}
+			return nil, current.String(), time.Time{}, 0, err
+		}
+		defer res.Body.Close()
+		if res.StatusCode >= 400 {
+			return nil, res.Request.URL.String(), time.Time{}, res.StatusCode, fmt.Errorf("status %d", res.StatusCode)
+		}
+		body, err := decodeBody(res)
+		if err != nil {
+			return nil, res.Request.URL.String(), time.Time{}, res.StatusCode, err
+		}
+		doc, err := goquery.NewDocumentFromReader(body)
+		if err != nil {
+			return nil, res.Request.URL.String(), time.Time{}, res.StatusCode, err
+		}
+		finalURL := res.Request.URL.String()
+		var lastModified time.Time
+		if last := res.Header.Get("Last-Modified"); last != "" {
+			if parsed, err := http.ParseTime(last); err == nil {
+				lastModified = parsed
+			}
+		}
+		return doc, finalURL, lastModified, res.StatusCode, nil
 	}
-	req.Header.Set("User-Agent", dc.pickAgent())
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.8,ru;q=0.7")
-	res, err := dc.httpClient.Do(req)
-	if err != nil {
-		return nil, raw, time.Time{}, 0, err
+}
+
+func shouldDowngradeTLS(err error) bool {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return false
 	}
-	defer res.Body.Close()
-	if res.StatusCode >= 400 {
-		return nil, req.URL.String(), time.Time{}, res.StatusCode, fmt.Errorf("status %d", res.StatusCode)
+	var hostnameErr x509.HostnameError
+	if errors.As(urlErr.Err, &hostnameErr) {
+		return true
 	}
-	body, err := decodeBody(res)
-	if err != nil {
-		return nil, req.URL.String(), time.Time{}, res.StatusCode, err
-	}
-	doc, err := goquery.NewDocumentFromReader(body)
-	if err != nil {
-		return nil, req.URL.String(), time.Time{}, res.StatusCode, err
-	}
-	finalURL := res.Request.URL.String()
-	var lastModified time.Time
-	if last := res.Header.Get("Last-Modified"); last != "" {
-		if parsed, err := http.ParseTime(last); err == nil {
-			lastModified = parsed
+	var certErr *x509.CertificateInvalidError
+	if errors.As(urlErr.Err, &certErr) {
+		if certErr.Reason == x509.HostnameError {
+			return true
 		}
 	}
-	return doc, finalURL, lastModified, res.StatusCode, nil
+	return false
 }
 
 func decodeBody(res *http.Response) (io.Reader, error) {
@@ -1214,7 +1244,15 @@ func inspectFields(form *goquery.Selection) (float64, []string) {
 func inspectContext(form *goquery.Selection, doc *goquery.Document) (float64, []string) {
 	score := 0.0
 	signals := []string{}
-	text := strings.ToLower(form.PrevAllFiltered("h1,h2,h3,h4,p,strong,div").Slice(0, 4).Text())
+	surrounding := form.PrevAllFiltered("h1,h2,h3,h4,p,strong,div")
+	limit := surrounding.Length()
+	if limit > 4 {
+		limit = 4
+	}
+	text := ""
+	if limit > 0 {
+		text = strings.ToLower(surrounding.Slice(0, limit).Text())
+	}
 	positives := []string{"leave a comment", "add comment", "post comment", "your thoughts", "ответить", "комментар", "обсуждени", "share feedback"}
 	negatives := []string{"contact", "support", "sales", "запрос", "обратная", "поддержк", "заказ"}
 	for _, kw := range positives {
