@@ -1593,6 +1593,10 @@ func (rw *ResultWriter) WriteFinding(f Finding) error {
 				})
 				return fmt.Errorf("write tier%d: %w", f.Tier, err)
 			}
+			tierFile = rw.tierFiles[f.Tier]
+			if tierFile == nil {
+				return fmt.Errorf("tier%d file missing after reopen", f.Tier)
+			}
 			if _, err := tierFile.WriteString(line); err != nil {
 				return fmt.Errorf("write tier%d after reopen: %w", f.Tier, err)
 			}
