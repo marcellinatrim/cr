@@ -3994,16 +3994,53 @@ func NewMainCrawler(config *Config, domains []string, logger *Logger) (*MainCraw
 }
 
 func (mc *MainCrawler) Run(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	mc.logger.Info("starting main crawler", map[string]interface{}{
 		"domains":            len(mc.domains),
 		"max_concurrent":     cap(mc.semaphore),
 		"workers_per_domain": mc.config.WorkersPerDomain,
 	})
 
+	// Привязываем внешний контекст к внутреннему, чтобы Shutdown и внешний cancel синхронизировались.
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			fields := map[string]interface{}{"source": "external"}
+			if err != nil {
+				fields["error"] = err.Error()
+			}
+			mc.logger.Info("received external cancellation", fields)
+			mc.cancel()
+		case <-done:
+		}
+	}()
+
+domainLoop:
 	for _, domain := range mc.domains {
 		if atomic.LoadInt32(&mc.shuttingDown) == 1 {
 			mc.logger.Info("shutdown in progress, skipping remaining domains", nil)
 			break
+		}
+
+		select {
+		case <-ctx.Done():
+			mc.logger.Info("external context canceled before scheduling domain", map[string]interface{}{
+				"domain": domain,
+			})
+			break domainLoop
+		case <-mc.ctx.Done():
+			mc.logger.Info("internal context canceled before scheduling domain", map[string]interface{}{
+				"domain": domain,
+			})
+			break domainLoop
+		default:
 		}
 
 		// Проверка, не завершён ли уже домен
@@ -4017,9 +4054,16 @@ func (mc *MainCrawler) Run(ctx context.Context) error {
 		// Захват семафора
 		select {
 		case mc.semaphore <- struct{}{}:
+		case <-ctx.Done():
+			mc.logger.Info("external context canceled while waiting for semaphore", map[string]interface{}{
+				"domain": domain,
+			})
+			break domainLoop
 		case <-mc.ctx.Done():
-			mc.logger.Info("context canceled while waiting for semaphore", nil)
-			break
+			mc.logger.Info("internal context canceled while waiting for semaphore", map[string]interface{}{
+				"domain": domain,
+			})
+			break domainLoop
 		}
 
 		mc.wg.Add(1)
@@ -4040,6 +4084,13 @@ func (mc *MainCrawler) Run(ctx context.Context) error {
 	mc.logger.Info("main crawler finished", map[string]interface{}{
 		"completed_domains": len(mc.completedDomains),
 	})
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := mc.ctx.Err(); err != nil {
+		return err
+	}
 
 	return nil
 }
