@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "updated_at": "2025-11-03T23:08:18.843309Z",
+  "pages": 1,
+  "findings": 0,
+  "tier_counts": {},
+  "errors_by_kind": {
+    "http_4xx": 8
+  },
+  "domains_completed": [
+    "example.com"
+  ]
+}
