@@ -1985,7 +1985,7 @@ func normalizeURL(rawURL string, baseURL *url.URL) (string, error) {
 		return "", errors.New("not http/https")
 	}
 
-	sanitizeParsedURL(u)
+	normalizeURLBasics(u)
 
 	// Проверка статических файлов
 	ext := strings.ToLower(filepath.Ext(u.Path))
@@ -1996,7 +1996,7 @@ func normalizeURL(rawURL string, baseURL *url.URL) (string, error) {
 	return u.String(), nil
 }
 
-func sanitizeParsedURL(u *url.URL) {
+func normalizeURLBasics(u *url.URL) {
 	if u == nil {
 		return
 	}
@@ -2010,6 +2010,13 @@ func sanitizeParsedURL(u *url.URL) {
 	}
 	if len(u.Path) > 1 && strings.HasSuffix(u.Path, "/") {
 		u.Path = strings.TrimSuffix(u.Path, "/")
+	}
+
+}
+
+func sanitizeQueryForDedup(u *url.URL) {
+	if u == nil {
+		return
 	}
 
 	if u.RawQuery == "" {
@@ -2066,7 +2073,8 @@ func canonicalVisitKey(raw string) string {
 		return trimmed
 	}
 
-	sanitizeParsedURL(u)
+	normalizeURLBasics(u)
+	sanitizeQueryForDedup(u)
 	return u.String()
 }
 
