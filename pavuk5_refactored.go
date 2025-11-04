@@ -3432,9 +3432,6 @@ func NewDomainCrawler(
 ) (*DomainCrawler, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
-	if config.DomainDeadline > 0 {
-		ctx, cancel = context.WithTimeout(context.Background(), config.DomainDeadline)
-	}
 
 	queuePath := filepath.Join(config.DiskQueueDir, sanitizeDomainName(domain)+".queue")
 	diskQueue, err := NewDiskQueue(queuePath, config.DiskBatchSize, logger)
@@ -3551,6 +3548,22 @@ func (dc *DomainCrawler) saveState() error {
 }
 
 func (dc *DomainCrawler) Start(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if dc.cancel != nil {
+		dc.cancel()
+	}
+
+	domainCtx, cancel := context.WithCancel(ctx)
+	if dc.config.DomainDeadline > 0 {
+		domainCtx, cancel = context.WithTimeout(domainCtx, dc.config.DomainDeadline)
+	}
+
+	dc.ctx = domainCtx
+	dc.cancel = cancel
+
 	dc.logger.Info("starting domain crawler", map[string]interface{}{"domain": dc.domain})
 
 	// Посев начальных URL
@@ -4237,10 +4250,10 @@ domainLoop:
 		"completed_domains": len(mc.completedDomains),
 	})
 
-	if err := ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	if err := mc.ctx.Err(); err != nil {
+	if err := mc.ctx.Err(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
 
@@ -4569,9 +4582,13 @@ func main() {
 
 	// Запуск краулера
 	if err := crawler.Run(ctx); err != nil {
-		logger.Error("crawler error", map[string]interface{}{"error": err.Error()})
-		os.Exit(1)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			logger.Info("crawler stopped by context", map[string]interface{}{"reason": err.Error()})
+		} else {
+			logger.Error("crawler error", map[string]interface{}{"error": err.Error()})
+			os.Exit(1)
+		}
+	} else {
+		logger.Info("crawler completed successfully", nil)
 	}
-
-	logger.Info("crawler completed successfully", nil)
 }
